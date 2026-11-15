@@ -1,0 +1,17 @@
+{
+  "mcp_servers": {
+    "coded-autonomous-qa": {
+      "command": "/opt/homebrew/bin/uv",
+      "args": ["--directory", "/Users/you/tools/coded-autonomous-qa-mcp", "run", "--extra", "selenium", "coded-qa", "serve"],
+      "env": {
+        "CODED_QA_ENVIRONMENT": "uat",
+        "CODED_QA_PERMISSION_MODE": "execution",
+        "CODED_QA_AUTOMATION_ENGINE": "selenium",
+        "CODED_QA_BROWSER": "chrome",
+        "CODED_QA_SELENIUM_REMOTE_URL": "http://localhost:4444/wd/hub",
+        "CODED_QA_ALLOWED_HOSTS": "*.uat.example.internal",
+        "CODED_QA_ALLOWED_ROOTS": "/Users/you/work/automation"
+      }
+    }
+  }
+}

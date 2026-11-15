@@ -22,6 +22,19 @@ Coded agent ──calls──▶ coded-autonomous-qa (MCP, stdio)
      └── record_* / ingest_* ─────────────────────────────────▶ knowledge base
 ```
 
+## Automation engines
+
+One adapter architecture, four engines, selected explicitly with `CODED_QA_AUTOMATION_ENGINE` (never a silent fallback):
+
+| Engine | Mode | Results |
+|---|---|---|
+| `coded-browser` (default) | host-mediated — Coded's `browser`/`view_image` tools | `host_reported` |
+| `pymidsense` | host-mediated — PyMidsense vision tools (verified host profile required) | `host_reported` |
+| `playwright` | direct — the server drives the browser (`uv sync --extra playwright`) | `independently_verified` assertions |
+| `selenium` | direct — WebDriver, local or Grid (`uv sync --extra selenium`) | `independently_verified` assertions |
+
+Every result records **who** established it (`host_reported`, `engine_confirmed`, `independently_verified`) and business rules become `verified` only from assertions the server evaluated itself. Details: [docs/engines.md](docs/engines.md).
+
 ## Quick start (macOS)
 
 ```bash
@@ -40,6 +53,7 @@ Paste the printed block into `~/.config/coded/config.json` (see [docs/coded-inte
 |---|---|
 | [docs/installation-macos.md](docs/installation-macos.md) | Install with uv, data locations, Keychain secrets, upgrades |
 | [docs/coded-integration.md](docs/coded-integration.md) | Coded MCP JSON, host profiles (Coded / PyMidsense), skills, POMs, test runner |
+| [docs/engines.md](docs/engines.md) | Engines, adapter architecture, install per engine, verification levels |
 | [docs/architecture.md](docs/architecture.md) | Layers, orchestration loop, truthful states, rule lifecycle, data model |
 | [docs/tools.md](docs/tools.md) | Every MCP tool, resource and prompt (generated from the server) |
 | [docs/workflows.md](docs/workflows.md) | Example QA workflows, step by step |
@@ -52,7 +66,9 @@ Paste the printed block into `~/.config/coded/config.json` (see [docs/coded-inte
 |---|---|
 | Coded MCP client (stdio, `mcp_servers`) | **Working** — tested with Coded's own `MCPManager` (`tests/integration/test_coded_host.py`). |
 | Coded `browser` / `view_image` / `skill` / `bash` tools | **Working** — built-in profile verified against Coded's source; action requests executed by Coded's real `browser` tool against a live page (`tests/integration/test_coded_browser_e2e.py`). |
-| PyMidsense vision tools | **Needs configuration** — the built-in `pymidsense` profile follows the pymidscene method names (`ai_click`, `ai_input`, `ai_query`, `ai_assert`, `ai_act`, …) but the tool *names* your Coded installation exposes were not available to inspect; copy the template and fill them in. Until then requests are flagged `tool_verified: false`. |
+| PyMidsense vision tools | **Needs configuration** — the built-in `pymidsense` profile follows the pymidscene method names (`ai_click`, `ai_input`, `ai_query`, `ai_assert`, `ai_act`, …) but the tool *names* your Coded installation exposes were not available to inspect. Until you supply a verified profile with the real names, the server **refuses** to produce any PyMidsense request (`unverified_host_tool`). Tested with a verified example profile. |
+| Playwright engine | **Working** — real Chromium in `tests/integration/test_direct_engines.py` (exploration, NL runs, rule verification/refutation, navigation guard, console/network capture). |
+| Selenium engine | **Working** — real Chrome via ChromeDriver in the same tests. Console/network capture needs Chrome or Edge. |
 | Automation Script Generator / POM generator skill | **Hand-off working, skill not inspected** — the server locates `SKILL.md` (e.g. `.idfc/skills/automation-script-generator`) and emits a `skill` call with structured component definitions. The skill itself was not available to review; its input expectations may need adjusting. |
 | Existing POMs | **Working (read-only)** — classes and locators are indexed with `ast` and reused in plans. Nothing is generated or rewritten. |
 | Existing test runner | **Working** — `run_existing_tests` emits the runner command for the host; `ingest_test_results` reads JUnit XML. |
@@ -61,8 +77,9 @@ Paste the printed block into `~/.config/coded/config.json` (see [docs/coded-inte
 ## Development
 
 ```bash
-uv sync                      # Python 3.11+, installs dev tools
-uv run pytest                # unit + MCP integration tests
+uv sync --all-extras         # Python 3.11+, dev tools + Playwright + Selenium
+uv run playwright install chromium
+uv run pytest                # unit, MCP integration and real-browser tests (browser tests skip if no browser)
 uv run ruff check . && uv run ruff format --check .
 CODED_REPO=~/coded uv run --with playwright --with rich --with prompt_toolkit --with openai \
   pytest tests/integration/test_coded_browser_e2e.py     # real browser end-to-end

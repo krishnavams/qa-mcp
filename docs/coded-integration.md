@@ -39,14 +39,19 @@ Copy [`examples/coded/skills/autonomous-qa/SKILL.md`](../examples/coded/skills/a
 | Profile | Tools | Status |
 |---|---|---|
 | `coded` (default) | `browser` (url + steps: click/fill/press/select/wait_for/wait), `view_image`, `skill`, `bash` | Verified against Coded's source (`coded/tools/browser.py`, `interact.py`, `skill.py`, `shell.py`) and exercised by the browser end-to-end test. |
-| `pymidsense` | PyMidsense vision calls: `ai_query`, `ai_click`, `ai_input`, `ai_act`, `ai_assert`, `ai_wait_for`, `ai_keyboard_press` | **Template.** Method semantics follow the `pymidscene` package; the tool names your Coded exposes for them could not be inspected. |
+| `pymidsense` | PyMidsense vision calls: `ai_query`, `ai_click`, `ai_input`, `ai_act`, `ai_assert`, `ai_wait_for`, `ai_keyboard_press` | **Template — never executes.** Method semantics follow the `pymidscene` package; the tool names your Coded exposes could not be inspected, so every name is a `REPLACE_…` placeholder and `verified` is false. The server refuses to build any request from it (`unverified_host_tool`). |
+
+Each profile declares its engine (`"engine": "coded-browser"` or `"pymidsense"`). `CODED_QA_AUTOMATION_ENGINE` may name it explicitly; a mismatch with the profile is an error, not a fallback. If `CODED_QA_HOST_PROFILE` points at a file that is missing, malformed, outside the allowed roots, or marked verified while still containing placeholders, host-mediated work is disabled with `profile_invalid` — the built-in `coded` profile is **not** substituted.
 
 ### Configuring PyMidsense
 
 1. In Coded, find the exact tool names your PyMidsense integration exposes (ask Coded to list its available tools; MCP-provided ones are named `mcp__<server>__<tool>`).
 2. Copy [`examples/profiles/pymidsense.local.json`](../examples/profiles/pymidsense.local.json) into your automation project, replace every tool name, keep the argument templates that match those tools, and set `"verified": true`.
 3. Point `CODED_QA_HOST_PROFILE` at it (the file must be inside `CODED_QA_ALLOWED_ROOTS`).
-4. `uv run coded-qa doctor` must report "host profile tools verified" with no placeholders.
+4. Set `"engine": "pymidsense"` in it and `CODED_QA_AUTOMATION_ENGINE=pymidsense`.
+5. `uv run coded-qa doctor` must report "host profile tools verified" with no placeholders and `automation engine: pymidsense` ready.
+
+Every capability a step needs must be present (`ui.navigate`, `ui.click`, `ui.fill`, … `ui.assert`); a missing one refuses the run with `unsupported_capability` instead of improvising.
 
 With the PyMidsense profile, steps carry natural-language targets (`"the Sign in button"`), so they work without selectors; `ui.observe` asks PyMidsense's `ai_query` for a schema that maps 1:1 onto `ScreenObservation`.
 
@@ -62,12 +67,24 @@ You can mix: keep `"batching": "per_step"` for vision tools, or `"browser_steps"
 | **Screenshots / logs** | Paths reported in `record_step_result` / observations are hashed when they are inside `CODED_QA_ALLOWED_ROOTS` (Coded's browser writes to `<cwd>/.coded/screenshots/`, so include the project root). Other paths are kept as unverified references. |
 | **Git** | Read-only (`diff`, `log`, `rev-parse`, `show`, `ls-files`, `status`, `merge-base`) on repositories inside the allowed roots. |
 
-## 5. Permission tiers
+## 5. Engines and what Coded's reports can prove
+
+| Engine | Executes | Step results | Can a rule become `verified`? |
+|---|---|---|---|
+| `coded-browser` | Coded's `browser` tool | `host_reported` | No — confidence and provenance are updated; status stays `observed` |
+| `pymidsense` | PyMidsense tools via Coded | `host_reported` | No (same) |
+| `playwright` / `selenium` | this server ([engines.md](engines.md)) | `independently_verified` for assertions | Yes, from the mapped assertion step |
+
+When Coded reports an assertion step as `passed` with `record_step_result`, it must include `actual` — what it saw. For text, URL and title expectations the server checks that `actual` actually contains the expected value and refuses a contradicting PASS (`assertion_evidence_mismatch`). Use a direct engine when you need independent verification; use the host engines when the page needs vision or Coded's interactive permission flow.
+
+## 6. Permission tiers
 
 Start in `discovery`: learning, rule discovery, planning, analysis, regression selection. Switch to `execution` (a second MCP entry, or change the env) when you want plans executed. Destructive steps additionally need `coded-qa approve`.
 
-## 6. What was verified
+## 7. What was verified
 
 - `tests/integration/test_coded_host.py` launches this server through **Coded's own `MCPManager`** (stdio, the same config shape as above), lists tools and resources, calls tools, and checks the `mcp__<server>__<tool>` naming.
-- `tests/integration/test_coded_browser_e2e.py` executes this server's action requests with **Coded's real `BrowserTool`** against a live local page: exploration (including clicking a link with a server-inferred selector), an NL test that reuses a selector from the knowledge base, and a mandatory-field rule verified by an executed probe.
+- `tests/integration/test_coded_browser_e2e.py` executes this server's action requests with **Coded's real `BrowserTool`** against a live local page: exploration (including clicking a link with a server-inferred selector), an NL test that reuses a selector from the knowledge base, and a mandatory-field probe whose host-reported pass raises the rule's confidence but (correctly) does not mark it verified.
+- `tests/integration/test_direct_engines.py` runs the Playwright and Selenium engines against a live local page, including rule verification and refutation.
+- `tests/unit/test_engines_and_safety.py` checks that the PyMidsense template never produces requests and that a verified PyMidsense profile produces the expected tool calls.
 - Not verified here: PyMidsense tool names, the Automation Script Generator skill's internals, and your organisation's test runner — each needs the access described above.

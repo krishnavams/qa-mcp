@@ -15,6 +15,13 @@ from coded_autonomous_qa.adapters.framework import (
 )
 from coded_autonomous_qa.adapters.host_tools import ActionPlanner, ProfileError, load_profile
 from coded_autonomous_qa.knowledge.models import StepAction, TestStep
+from coded_autonomous_qa.safety.guards import SafetyError, resolve_navigation_url
+from tests.conftest import make_settings
+
+
+def planner(profile, tmp_path, workspace):
+    s = make_settings(tmp_path, workspace)
+    return ActionPlanner(profile, lambda t, b: resolve_navigation_url(t, b, s))
 
 
 def steps():
@@ -26,26 +33,27 @@ def steps():
 
 
 class TestHostProfiles:
-    def test_coded_profile_batches_into_one_browser_call(self):
-        reqs = ActionPlanner(load_profile("coded")).execute_steps(
+    def test_coded_profile_batches_into_one_browser_call(self, tmp_path, workspace):
+        reqs = planner(load_profile("coded"), tmp_path, workspace).execute_steps(
             "http://localhost/login", steps(), purpose="p", report_with="record_step_result", report_hint={}
         )
         assert len(reqs) == 1
         r = reqs[0]
-        assert r.host_tool == "browser" and r.tool_verified
+        assert r.host_tool == "browser" and r.tool_verified and r.engine == "coded-browser"
         assert r.arguments["url"] == "http://localhost/login"
         assert [s["action"] for s in r.arguments["steps"]] == ["fill", "click"]
         assert r.arguments["steps"][1]["selector"] == "#login"
         assert sorted(r.selector_sources.values()) == ["inferred:name_or_id", "known"]
         assert r.report_hint["judge_from_result"][0]["instruction"].startswith("assert")
 
-    def test_pymidsense_template_is_flagged_unverified(self):
-        reqs = ActionPlanner(load_profile("pymidsense")).execute_steps(
-            "http://localhost/login", steps(), purpose="p", report_with="x", report_hint={}
-        )
-        assert len(reqs) == 4  # navigate + one call per step
-        assert all(not r.tool_verified for r in reqs if r.capability.startswith("ui."))
-        assert reqs[1].arguments == {"prompt": "username", "text": "qa"}
+    def test_pymidsense_template_never_produces_requests(self, tmp_path, workspace):
+        p = planner(load_profile("pymidsense"), tmp_path, workspace)
+        with pytest.raises(SafetyError) as e:
+            p.execute_steps("http://localhost/login", steps(), purpose="p", report_with="x", report_hint={})
+        assert e.value.code == "unverified_host_tool"
+        with pytest.raises(SafetyError) as e:
+            p.invoke_skill("x", {}, purpose="p")  # even real tool names are refused while the profile is unverified
+        assert e.value.code == "unverified_host_tool"
 
     def test_custom_profile_must_be_inside_allowed_roots(self, tmp_path, workspace):
         prof = tmp_path / "p.json"

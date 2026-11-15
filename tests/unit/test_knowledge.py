@@ -10,7 +10,12 @@ from coded_autonomous_qa.knowledge.models import (
     EvidenceKind,
     RuleStatus,
     RuleType,
+    VerificationLevel,
 )
+
+
+def execution(level):
+    return Evidence(kind=EvidenceKind.EXECUTION, summary="probe assertion evaluated", verification=level)
 
 
 def rule(status=RuleStatus.OBSERVED, evidence=None, source="observation", **kw):
@@ -31,7 +36,9 @@ class TestRuleTruthfulness:
     def test_verified_requires_execution_evidence(self):
         with pytest.raises(ValidationError, match="execution evidence"):
             rule(RuleStatus.VERIFIED)
-        ok = rule(RuleStatus.VERIFIED, evidence=[Evidence(kind=EvidenceKind.EXECUTION, summary="probe passed")])
+        with pytest.raises(ValidationError, match="independently verified"):
+            rule(RuleStatus.VERIFIED, evidence=[execution(VerificationLevel.HOST_REPORTED)])
+        ok = rule(RuleStatus.VERIFIED, evidence=[execution(VerificationLevel.INDEPENDENTLY_VERIFIED)])
         assert ok.status is RuleStatus.VERIFIED
 
     def test_ai_rules_cannot_be_observed(self):
@@ -54,7 +61,7 @@ class TestRuleTruthfulness:
 class TestRepository:
     def test_upsert_merges_and_never_downgrades(self, tmp_path):
         repo = SQLiteKnowledgeRepository(tmp_path / "kb.db")
-        verified = rule(RuleStatus.VERIFIED, evidence=[Evidence(kind=EvidenceKind.EXECUTION, summary="ran")])
+        verified = rule(RuleStatus.VERIFIED, evidence=[execution(VerificationLevel.INDEPENDENTLY_VERIFIED)])
         repo.upsert_rule(verified)
         merged, created = repo.upsert_rule(rule(RuleStatus.OBSERVED))
         assert not created

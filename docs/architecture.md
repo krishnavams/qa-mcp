@@ -18,6 +18,7 @@ src/coded_autonomous_qa/
 ├── safety/             guards.py (env, URL, paths, permission tier, destructive terms),
 │                       masking.py (PII/secrets), secrets.py (${secret:NAME} → Keychain)
 ├── knowledge/          models.py (pydantic), repository.py (Protocol), sqlite_repo.py
+├── adapters/browser/   engine registry, BrowserAdapter base, Playwright + Selenium adapters, semantic targeting
 ├── adapters/           host_tools.py (profiles → action requests), git_adapter.py,
 │                       code_index.py (POM scan, import graph), framework.py (skills, JUnit, read-only DB)
 ├── profiles/           coded.json (verified), pymidsense.json (template)
@@ -26,6 +27,10 @@ src/coded_autonomous_qa/
 ```
 
 Engines depend only on `EngineContext` (settings + `KnowledgeRepository` Protocol + host profile). The MCP layer is thin: it validates input with pydantic, calls one engine method, audits and masks.
+
+## Engines
+
+Host-mediated engines (`coded-browser`, `pymidsense`) hand the host action requests; direct engines (`playwright`, `selenium`) are driven by the server itself through the `BrowserAdapter` interface. Selection is explicit and fails closed; see [engines.md](engines.md). The orchestration loop below applies to host-mediated engines; with a direct engine `execute_test_plan`, `verify_business_rules` and `explore_application` return `executed`/`recorded` results directly.
 
 ## The orchestration loop
 
@@ -36,7 +41,7 @@ host ──host tool──▶ application (browser / PyMidsense / skill / bash)
 host ──record_*───▶ server: store with evidence, advance state, maybe new action_requests
 ```
 
-An **action request** is:
+An **action request** is built only for a capability whose host tool is verified (profile `verified: true`, a real tool name — never a `REPLACE_…` placeholder) and only after every navigation target passed `resolve_navigation_url`:
 
 ```json
 {
@@ -68,14 +73,28 @@ Reports list unreported steps as **PENDING**; a run outcome is `passed` only if 
 
 ```
             observation (attribute, marker, message, state change)
- inferred ─────────────────────────────────────────────────▶ observed
- (heuristic / AI)                                               │
-     │                     executed probe run (all steps pass)  ▼
-     └──────────────────────────────────────────────────────▶ verified
-                           executed probe, assertion fails  ──▶ refuted
+ inferred ─────────────────────────────────────────────────▶ observed ──┐ host-reported probe result:
+ (heuristic / AI)                                               │       │ status unchanged, confidence ±,
+                                                                │       │ provenance recorded
+            probe run whose MAPPED assertion step was           ▼       │
+            independently verified by a direct engine  ──▶ verified ◀───┘ (never from host reports)
+            … and that assertion failed                 ──▶ refuted
 ```
 
-Enforced in `BusinessRule` validation: `verified`/`refuted` require `execution` evidence; `observed` requires non-AI evidence; AI proposals are stored `inferred` with confidence ≤ 0.6. Re-discovery merges evidence and never downgrades a status.
+Every probe test case maps each rule to the one assertion step that decides it (`TestCase.rule_assertions`), and that step carries a structured `Assertion` (e.g. `input_rejected` for a mandatory/length/format rule, `element_visible` for a dependency, `url_contains` for a transition). When the run finishes:
+
+| Mapped assertion result | Rule |
+|---|---|
+| `independently_verified` + passed, all earlier probe steps passed | `verified`, confidence ≥ 0.95 |
+| `independently_verified` + failed, all earlier probe steps passed | `refuted` |
+| `host_reported` passed / failed | status unchanged; confidence +0.1 (max 0.9) / −0.2; provenance stored |
+| earlier step failed/blocked, or no mapped machine-checkable assertion | inconclusive, unchanged |
+
+`BusinessRule.verification` keeps the latest provenance (level, run, step, assertion, engine, reporter, observed value, verdict). Validation enforces it: `verified`/`refuted` require `execution` evidence whose `verification` is `independently_verified`; `observed` requires non-AI evidence; AI proposals are stored `inferred` with confidence ≤ 0.6. Re-discovery merges evidence and never downgrades a status.
+
+## Results and provenance
+
+Every `StepResult` has `verification` (`independently_verified`, `engine_confirmed`, `host_reported`, `unverified`), `provenance` (reporter, engine, browser session, URL, duration) and, for evaluated assertions, `assertion_result` (assertion, observed value, evaluator). Host reports are accepted only for host-mediated runs; a host `PASSED` on an assertion step must include `actual`, and for text/URL/title assertions `actual` must contain the expected value (`assertion_evidence_required` / `assertion_evidence_mismatch`). A run's `pass_basis` states what its pass rests on.
 
 ## Knowledge base
 

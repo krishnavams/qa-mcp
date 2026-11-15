@@ -58,9 +58,26 @@ class TestNaturalLanguage:
         assert run["secret_note"] and "${secret:QA_PW}" in str(run["action_requests"])  # never resolved by default
         report = services.nl.generate_execution_report(run["run_id"])
         assert report["execution_state"] == "awaiting_host_execution" and "PENDING" in report["markdown"]
-        for r in services.repo.list_step_results(run["run_id"]):
-            last = services.execution.record_step_result(run["run_id"], r.step_id, StepStatus.PASSED, "browser")
-        assert last["outcome"] == "passed"
+        results = services.repo.list_step_results(run["run_id"])
+        assert_step = results[-1]
+        # Finding D: an assertion PASS needs the observation that supports it, and it must be consistent.
+        with pytest.raises(SafetyError) as e:
+            services.execution.record_step_result(run["run_id"], assert_step.step_id, StepStatus.PASSED, "browser")
+        assert e.value.code == "assertion_evidence_required"
+        with pytest.raises(SafetyError) as e:
+            services.execution.record_step_result(
+                run["run_id"], assert_step.step_id, StepStatus.PASSED, "browser", actual="Login failed"
+            )
+        assert e.value.code == "assertion_evidence_mismatch"
+        for r in results:
+            last = services.execution.record_step_result(
+                run["run_id"], r.step_id, StepStatus.PASSED, "browser", actual="Dashboard - welcome back"
+            )
+        assert last["outcome"] == "passed" and last["pass_basis"] == "host_reported"
+        assert all(x.verification.value == "host_reported" for x in services.repo.list_step_results(run["run_id"]))
+        report = services.nl.generate_execution_report(run["run_id"])["markdown"]
+        assert "Pass basis: **host_reported**" in report
+        assert "| host_reported |" in report and "| independently_verified |" not in report
         with pytest.raises(SafetyError):
             services.execution.record_step_result(run["run_id"], r.step_id, StepStatus.FAILED, "browser")
 

@@ -107,15 +107,35 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     )
     print(f"• permission mode: {s.permission_mode.value}")
     p = svc.ctx.profile
+    if p is None:
+        line(False, f"host profile '{s.host_profile}' is INVALID (fails closed): {svc.profile_error}")
+    else:
+        line(True, f"host profile {p.name} ({p.source}), engine {p.engine}")
+        placeholders = [c for c in p.capabilities if p.tool_is_placeholder(c)]
+        line(
+            p.verified and not placeholders,
+            "host profile tools verified" + (f" — placeholders: {', '.join(placeholders)}" if placeholders else ""),
+        )
+    from coded_autonomous_qa.server import engine_status
+
+    eng = engine_status(svc)
+    sel = eng["selected"]
     line(
-        svc.profile_error is None,
-        f"host profile {p.name} ({p.source})" + (f": {svc.profile_error}" if svc.profile_error else ""),
+        sel["ready"],
+        f"automation engine: {sel.get('name', sel['configured'])}" + ("" if sel["ready"] else f" — {sel.get('error')}"),
     )
-    placeholders = [c for c in p.capabilities if p.tool_is_placeholder(c)]
-    line(
-        p.verified and not placeholders,
-        "host profile tools verified" + (f" — placeholders: {', '.join(placeholders)}" if placeholders else ""),
-    )
+    for name, info in eng["registered"].items():
+        missing = info["missing_dependencies"]
+        print(
+            f"  • {name:<14} {info['mode']:<14} "
+            + (
+                f"missing {', '.join(missing)} ({info['install']})"
+                if missing
+                else (
+                    "needs a verified host profile for this engine" if info["mode"] == "host_mediated" else "installed"
+                )
+            )
+        )
     from coded_autonomous_qa.adapters.framework import locate_skill
 
     for name in {s.script_generator_skill, s.pom_generator_skill}:

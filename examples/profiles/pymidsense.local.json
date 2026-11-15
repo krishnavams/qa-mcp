@@ -1,5 +1,6 @@
 {
   "name": "pymidsense-local",
+  "engine": "pymidsense",
   "description": "Copy of the PyMidsense template. Replace each REPLACE_ tool name with the exact name Coded exposes, then set verified=true.",
   "verified": false,
   "batching": "per_step",
@@ -87,6 +88,6 @@
   },
   "notes": [
     "Method semantics follow the pymidscene package (ai_click, ai_input, ai_query, ai_assert, ai_act, ai_wait_for, ai_keyboard_press).",
-    "Until verified=true, every action request is flagged tool_verified=false and the host must map it to a real tool."
+    "Until verified=true and every REPLACE_ name is replaced, the server refuses to build any request from this profile (error unverified_host_tool)."
   ]
 }
