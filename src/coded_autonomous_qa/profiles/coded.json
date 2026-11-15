@@ -1,0 +1,63 @@
+{
+  "name": "coded",
+  "engine": "coded-browser",
+  "description": "Tools of the open-source Coded agent (krishnavams/coded). Verified against coded/tools/browser.py, coded/tools/interact.py (view_image), coded/tools/skill.py and coded/tools/shell.py (bash).",
+  "verified": true,
+  "batching": "browser_steps",
+  "capabilities": {
+    "ui.observe": {
+      "tool": "browser",
+      "arguments": {
+        "url": "{url}",
+        "screenshot": true
+      },
+      "followups": [
+        {
+          "tool": "view_image",
+          "arguments": {
+            "path": "<screenshot path returned by browser>"
+          },
+          "purpose": "Vision pass: identify fields, controls, labels, required markers and messages."
+        }
+      ]
+    },
+    "ui.interact": {
+      "tool": "browser",
+      "arguments": {
+        "url": "{url}",
+        "steps": "{steps}",
+        "screenshot": true
+      }
+    },
+    "skill.invoke": {
+      "tool": "skill",
+      "arguments": {
+        "name": "{skill}",
+        "args": "{args}"
+      }
+    },
+    "tests.run": {
+      "tool": "bash",
+      "arguments": {
+        "command": "{command}"
+      }
+    }
+  },
+  "step_actions": {
+    "click": "click",
+    "fill": "fill",
+    "select": "select",
+    "check": "click",
+    "press": "press",
+    "wait": "wait",
+    "assert": null,
+    "observe": null,
+    "navigate": null,
+    "ai_action": null
+  },
+  "notes": [
+    "The Coded browser tool starts a fresh browser per call, so all steps of one test case are sent as one call.",
+    "browser needs \"browser\": true in Coded config and Playwright installed; acting steps ask the user first.",
+    "Assertions are judged by the host from the browser result (visible text, console errors) and reported with record_step_result."
+  ]
+}

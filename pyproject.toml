@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coded-autonomous-qa-mcp"
+version = "0.1.0"
+description = "Coded Autonomous QA: a standalone MCP server for application learning, business-rule discovery, bug hunting, natural-language testing and regression intelligence."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=1.9",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+# Direct automation engines — install only what you use.
+playwright = ["playwright>=1.40"]
+selenium = ["selenium>=4.15"]
+all-engines = ["playwright>=1.40", "selenium>=4.15"]
+
+[project.scripts]
+coded-qa = "coded_autonomous_qa.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coded_autonomous_qa"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF012", "B008", "SIM105"]
