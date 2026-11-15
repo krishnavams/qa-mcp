@@ -1,0 +1,35 @@
+{
+  "name": "pymidsense",
+  "description": "TEMPLATE for PyMidsense/PyMidscene vision tools exposed by your Coded installation. The tool names below are placeholders: copy this file, replace each 'tool' with the exact tool name Coded shows (e.g. mcp__pymidsense__ai_click), set verified=true, and point CODED_QA_HOST_PROFILE at the copy.",
+  "verified": false,
+  "batching": "per_step",
+  "capabilities": {
+    "ui.observe": {
+      "tool": "REPLACE_pymidsense_ai_query",
+      "arguments": {
+        "url": "{url}",
+        "data_schema": {
+          "screen_name": "name of this screen",
+          "fields": "every input field: name, label, type, required marker, max length, options, validation message",
+          "controls": "every button, link and tab: label and kind",
+          "messages": "visible error, warning and success messages"
+        }
+      }
+    },
+    "ui.navigate": {"tool": "REPLACE_pymidsense_goto", "arguments": {"url": "{url}"}},
+    "ui.click": {"tool": "REPLACE_pymidsense_ai_click", "arguments": {"prompt": "{target}"}},
+    "ui.fill": {"tool": "REPLACE_pymidsense_ai_input", "arguments": {"prompt": "{target}", "text": "{value}"}},
+    "ui.select": {"tool": "REPLACE_pymidsense_ai_act", "arguments": {"action": "select '{value}' in {target}"}},
+    "ui.check": {"tool": "REPLACE_pymidsense_ai_click", "arguments": {"prompt": "{target} checkbox"}},
+    "ui.press": {"tool": "REPLACE_pymidsense_ai_keyboard_press", "arguments": {"key": "{value}"}},
+    "ui.wait": {"tool": "REPLACE_pymidsense_ai_wait_for", "arguments": {"assertion": "{expected}"}},
+    "ui.assert": {"tool": "REPLACE_pymidsense_ai_assert", "arguments": {"assertion": "{expected}"}},
+    "ui.ai_action": {"tool": "REPLACE_pymidsense_ai_act", "arguments": {"action": "{target}"}},
+    "skill.invoke": {"tool": "skill", "arguments": {"name": "{skill}", "args": "{args}"}},
+    "tests.run": {"tool": "bash", "arguments": {"command": "{command}"}}
+  },
+  "notes": [
+    "Method semantics follow the pymidscene package (ai_click, ai_input, ai_query, ai_assert, ai_act, ai_wait_for, ai_keyboard_press).",
+    "Until verified=true, every action request is flagged tool_verified=false and the host must map it to a real tool."
+  ]
+}

@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+.env
+# Runtime data lives in ~/Library/Application Support/coded-autonomous-qa — never in the repo.
+.coded-qa/
