@@ -19,6 +19,17 @@ uv run coded-qa --version
 uv run pytest -q            # optional: run the test suite
 ```
 
+## Optional engines
+
+```bash
+uv sync --extra playwright && uv run playwright install chromium   # Playwright engine
+uv sync --extra selenium                                           # Selenium engine (Chrome/Edge/Firefox installed)
+uv sync --extra all-engines                                        # both
+```
+
+With a direct engine, add the extra to the Coded command so `uv run` keeps it installed:
+`"args": ["--directory", "…/coded-autonomous-qa-mcp", "run", "--extra", "playwright", "coded-qa", "serve"]`.
+
 ## Configure
 
 All settings are environment variables, normally set in the Coded MCP block (see [coded-integration.md](coded-integration.md)).
@@ -39,6 +50,8 @@ All settings are environment variables, normally set in the Coded MCP block (see
 | `CODED_QA_DESTRUCTIVE_KEYWORDS` | — | Extra words that make a step need approval. |
 | `CODED_QA_APPROVAL_TTL_MINUTES` | `120` | How long an approval stays valid. |
 | `CODED_QA_MAX_SCREENS_PER_RUN` | `40` | Exploration limit. |
+| `CODED_QA_AUTOMATION_ENGINE` | *(profile's engine)* | `coded-browser`, `pymidsense`, `playwright` or `selenium` — see [engines.md](engines.md). |
+| `CODED_QA_BROWSER`, `CODED_QA_HEADLESS`, `CODED_QA_BROWSER_EXECUTABLE`, `CODED_QA_WEBDRIVER_PATH`, `CODED_QA_WEBDRIVER_ARGS`, `CODED_QA_SELENIUM_REMOTE_URL`, `CODED_QA_ACTION_TIMEOUT_MS`, `CODED_QA_VIEWPORT` | | Direct-engine browser options ([engines.md](engines.md#browser-options-direct-engines)). |
 | `CODED_QA_DATA_DIR` | `~/Library/Application Support/coded-autonomous-qa` | Override the data location. |
 | `CODED_QA_LOG_LEVEL` | `INFO` | Log level (stderr, JSON lines). |
 

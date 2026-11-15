@@ -1,0 +1,17 @@
+{
+  "mcp_servers": {
+    "coded-autonomous-qa": {
+      "command": "/opt/homebrew/bin/uv",
+      "args": ["--directory", "/Users/you/tools/coded-autonomous-qa-mcp", "run", "--extra", "playwright", "coded-qa", "serve"],
+      "env": {
+        "CODED_QA_ENVIRONMENT": "qa",
+        "CODED_QA_PERMISSION_MODE": "execution",
+        "CODED_QA_AUTOMATION_ENGINE": "playwright",
+        "CODED_QA_BROWSER": "chromium",
+        "CODED_QA_HEADLESS": "true",
+        "CODED_QA_ALLOWED_HOSTS": "localhost,127.0.0.1,*.qa.example.internal",
+        "CODED_QA_ALLOWED_ROOTS": "/Users/you/work/automation"
+      }
+    }
+  }
+}

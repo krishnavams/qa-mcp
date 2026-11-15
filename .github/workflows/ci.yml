@@ -16,7 +16,13 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: uv sync --locked
+      - run: uv sync --locked --all-extras
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pytest -q
+      - run: uv run playwright install --with-deps chromium
+        if: runner.os == 'Linux'
+      - run: uv run playwright install chromium
+        if: runner.os == 'macOS'
+      - run: uv run pytest -q -rs
+        env:
+          CODED_QA_TEST_WEBDRIVER_ARGS: ""
