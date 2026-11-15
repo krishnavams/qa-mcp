@@ -400,6 +400,20 @@ class TestMalformedUrls:
             resolve_navigation_url(target, "http://localhost:8080/login", s)
         assert e.value.code == "invalid_url"
 
+    @pytest.mark.parametrize("netloc", ["[::1]x", "[::1]:80x", "[::1", "::1]", "[127.0.0.1]", "[zz]", "[::1]]"])
+    def test_lenient_stdlib_parser_cannot_bypass(self, tmp_path, workspace, monkeypatch, netloc):
+        """Older Python patch releases' urlsplit accepts some of these without raising; the guard must not
+        depend on that. Simulate the lenient parser and require a structured refusal."""
+        from urllib.parse import SplitResult
+
+        import coded_autonomous_qa.safety.guards as guards
+
+        monkeypatch.setattr(guards, "urlsplit", lambda u: SplitResult("http", netloc, "/", "", ""))
+        s = make_settings(tmp_path, workspace, allowed_hosts=["localhost", "::1"])
+        with pytest.raises(SafetyError) as e:
+            validate_app_url(f"http://{netloc}/", s)
+        assert e.value.code == "invalid_url"
+
     def test_malformed_base_url(self, tmp_path, workspace):
         with pytest.raises(SafetyError) as e:
             resolve_navigation_url("/x", "http://[::1/", make_settings(tmp_path, workspace))

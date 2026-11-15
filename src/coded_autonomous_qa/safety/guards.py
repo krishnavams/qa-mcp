@@ -47,6 +47,7 @@ def _host_allowed(host: str, allowed: list[str]) -> bool:
 
 
 _FORBIDDEN_URL_CHARS = re.compile(r"[\x00-\x20\x7f\\]")  # whitespace, control chars, backslash
+_BRACKETED_AUTHORITY = re.compile(r"\[([0-9A-Fa-f:.]+)\](?::\d{1,5})?")
 _HOST_CHARS = re.compile(r"^[a-z0-9.\-]+$|^\[[0-9a-f:.]+\]$")
 
 
@@ -70,6 +71,12 @@ def validate_app_url(url: str, settings: Settings) -> str:
         )
     if "@" in parts.netloc or parts.username or parts.password:
         raise SafetyError("URLs must not embed credentials; use ${secret:NAME} references.", code="invalid_url")
+    # Validate a bracketed (IPv6) authority ourselves: older Python patch releases' urlsplit accepts text after
+    # the closing bracket (e.g. "[::1]x"), so the stdlib cannot be relied on here.
+    if "[" in parts.netloc or "]" in parts.netloc:
+        m = _BRACKETED_AUTHORITY.fullmatch(parts.netloc)
+        if not m or ":" not in m.group(1) or not _is_ip(m.group(1)):
+            raise SafetyError("URL host is not a valid bracketed IPv6 address.", code="invalid_url")
     try:
         raw_host = parts.hostname or ""
     except ValueError as exc:  # hostname parsing can fail on odd bracket syntax
