@@ -220,3 +220,22 @@ async def test_action_requests_are_not_masked_but_results_are(server):
             )
         )
         assert "jane.doe@corp.test" not in json.dumps(plan)  # informational output is masked
+
+
+async def test_invalid_profile_fails_closed_over_mcp(tmp_path, workspace):
+    (workspace / "broken.json").write_text(
+        '{"name": "x", "verified": true, "capabilities": {"ui.click": {"tool": "REPLACE_x"}}}'
+    )
+    settings = make_settings(
+        tmp_path, workspace, host_profile=str(workspace / "broken.json"), host_profile_explicit=True
+    )
+    mcp, _ = create_server(settings, SQLiteKnowledgeRepository(settings.db_path))
+    async with Client(mcp) as c:
+        status = data(await c.call_tool("get_server_status", {}))
+        hp = status["integrations"]["host_profile"]
+        assert hp["loaded"] is False and "placeholder" in hp["error"]
+        assert status["integrations"]["automation_engine"]["selected"]["ready"] is False
+        app_id = data(await c.call_tool("register_application", {"name": "B", "base_url": BASE}))["application"]["id"]
+        out = data(await c.call_tool("explore_application", {"app_id": app_id}))
+        assert out["execution_state"] == "blocked" and out["error_code"] == "profile_invalid"
+        assert "action_requests" not in out

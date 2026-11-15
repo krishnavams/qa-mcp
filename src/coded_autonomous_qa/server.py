@@ -17,8 +17,9 @@ from typing import Annotated, Any
 from pydantic import Field, ValidationError
 
 from coded_autonomous_qa import __version__
+from coded_autonomous_qa.adapters.browser import engine_names, get_engine
 from coded_autonomous_qa.adapters.framework import ReadOnlyQueryError, locate_skill, run_readonly_query
-from coded_autonomous_qa.adapters.host_tools import load_profile
+from coded_autonomous_qa.adapters.host_tools import ProfileError, load_profile
 from coded_autonomous_qa.config import PermissionMode, Settings, get_settings
 from coded_autonomous_qa.engines.bug_hunter import BugHunterEngine
 from coded_autonomous_qa.engines.business_rules import BusinessRuleEngine
@@ -61,17 +62,38 @@ EXECUTION = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldH
 AppId = Annotated[str, Field(description="Application id or registered name.")]
 
 
+def engine_status(svc: Services) -> dict[str, Any]:
+    """Selected engine and the readiness of every registered engine (never substitutes one for another)."""
+    selected: dict[str, Any] = {"configured": svc.settings.automation_engine or "(from host profile)"}
+    try:
+        spec = svc.ctx.engine()
+        selected.update(name=spec.name, mode=spec.mode, ready=True)
+    except SafetyError as exc:
+        selected.update(ready=False, error=str(exc), error_code=exc.code)
+    engines = {}
+    for name in engine_names():
+        spec = get_engine(name)
+        engines[name] = {
+            "mode": spec.mode,
+            "description": spec.description,
+            "missing_dependencies": spec.missing_dependencies(),
+            "install": spec.install or None,
+        }
+    return {"selected": selected, "registered": engines}
+
+
 class Services:
     def __init__(self, settings: Settings, repo: KnowledgeRepository) -> None:
         self.settings = settings
         self.repo = repo
         self.profile_error: str | None = None
+        profile = None
         try:
             profile = load_profile(settings.host_profile, settings.readable_roots())
-        except Exception as exc:
+        except ProfileError as exc:  # fail closed: never substitute another profile
             self.profile_error = str(exc)
-            profile = load_profile("coded")
-        self.ctx = EngineContext(settings=settings, repo=repo, profile=profile)
+            log.error("host profile invalid; host-mediated work is disabled", extra={"ctx": {"error": str(exc)}})
+        self.ctx = EngineContext(settings=settings, repo=repo, profile=profile, profile_error=self.profile_error)
         self.execution = ExecutionEngine(self.ctx)
         self.explorer = ExplorerEngine(self.ctx)
         self.rules = BusinessRuleEngine(self.ctx, self.execution)
@@ -518,12 +540,18 @@ def create_server(settings: Settings | None = None, repo: KnowledgeRepository | 
         }
         integrations = {
             "host_profile": {
-                "name": profile.name,
-                "source": profile.source,
-                "verified": profile.verified,
+                "configured": s.host_profile,
+                "loaded": profile is not None,
+                "name": profile.name if profile else None,
+                "engine": profile.engine if profile else None,
+                "source": profile.source if profile else None,
+                "verified": profile.verified if profile else False,
                 "error": svc.profile_error,
-                "placeholder_capabilities": [c for c in profile.capabilities if profile.tool_is_placeholder(c)],
+                "placeholder_capabilities": [c for c in profile.capabilities if profile.tool_is_placeholder(c)]
+                if profile
+                else [],
             },
+            "automation_engine": engine_status(svc),
             "skills": skills,
             "pom_dirs": [{"path": str(p), "exists": p.is_dir()} for p in s.pom_dirs],
             "test_runner": " ".join(s.test_runner_cmd),

@@ -1,10 +1,18 @@
-"""Host-tool catalog and action-request builder.
+"""Host-tool catalog and action-request builder (host-mediated engines: coded-browser, pymidsense).
 
 The MCP server cannot call another MCP server or the host's built-in tools —
 that is not part of MCP. So the server describes *what to call* and the host
 agent (Coded) calls it, then reports back. A **host profile** maps abstract
 capabilities (``ui.observe``, ``ui.click`` …) onto the host's real tool names
 and argument shapes.
+
+Hard rules enforced here:
+
+* a request is only ever built for a capability whose tool is **verified** — a profile marked
+  ``verified: true`` with a real tool name. Placeholder (``REPLACE_…``) or unverified tools raise
+  ``unverified_host_tool``; capabilities the profile lacks raise ``unsupported_capability``;
+* a verified profile that still contains placeholders is rejected when it is loaded;
+* every navigation URL goes through the server's navigation resolver (``resolve_navigation_url``).
 
 Two batching styles exist:
 
@@ -17,16 +25,21 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from coded_autonomous_qa.adapters.browser.semantic import target_for_step, to_description, to_playwright_selector
 from coded_autonomous_qa.knowledge.models import StepAction, TestStep, new_id
+from coded_autonomous_qa.safety.guards import SafetyError
 
 _PLACEHOLDER = re.compile(r"\{(\w+)\}")
+_TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.:\-]{0,127}$")
 BUILTIN_PROFILES = ("coded", "pymidsense")
+HOST_ENGINES = ("coded-browser", "pymidsense")
 
 
 class ActionRequest(BaseModel):
@@ -34,13 +47,14 @@ class ActionRequest(BaseModel):
 
     id: str = Field(default_factory=lambda: new_id("act"))
     capability: str
-    host_tool: str | None
+    host_tool: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     purpose: str
     report_with: str | None = Field(default=None, description="MCP tool of this server to report the outcome to.")
     report_hint: dict[str, Any] = Field(default_factory=dict)
     followups: list[dict[str, Any]] = Field(default_factory=list)
-    tool_verified: bool = Field(description="False when the profile's tool name is an unconfirmed placeholder.")
+    tool_verified: bool = Field(description="Always true: requests are never built for unverified tools.")
+    engine: str = Field(description="Host-mediated engine that will perform it.")
     step_ids: list[str] = Field(default_factory=list)
     selector_sources: dict[str, str] = Field(default_factory=dict)
     contains_secret_refs: bool = False
@@ -48,6 +62,7 @@ class ActionRequest(BaseModel):
 
 class HostProfile(BaseModel):
     name: str
+    engine: str = Field(default="coded-browser", description="coded-browser | pymidsense")
     description: str = ""
     verified: bool = False
     batching: str = "per_step"
@@ -55,6 +70,24 @@ class HostProfile(BaseModel):
     step_actions: dict[str, str | None] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     source: str = "builtin"
+
+    @model_validator(mode="after")
+    def _consistent(self) -> HostProfile:
+        if self.engine not in HOST_ENGINES:
+            raise ValueError(f"engine must be one of {', '.join(HOST_ENGINES)} (got {self.engine!r})")
+        if self.batching not in ("browser_steps", "per_step"):
+            raise ValueError("batching must be 'browser_steps' or 'per_step'")
+        for cap, spec in self.capabilities.items():
+            tool = spec.get("tool")
+            if not isinstance(tool, str) or not tool:
+                raise ValueError(f"capability {cap!r} has no tool name")
+            if self.verified and tool.startswith("REPLACE_"):
+                raise ValueError(
+                    f"profile is marked verified but capability {cap!r} still uses placeholder tool {tool!r}"
+                )
+            if not tool.startswith("REPLACE_") and not _TOOL_NAME.match(tool):
+                raise ValueError(f"capability {cap!r}: {tool!r} is not a valid tool name")
+        return self
 
     def has(self, capability: str) -> bool:
         return capability in self.capabilities
@@ -67,23 +100,44 @@ class HostProfile(BaseModel):
         tool = self.tool_for(capability)
         return tool is None or tool.startswith("REPLACE_")
 
+    def is_executable(self, capability: str) -> bool:
+        return self.verified and self.has(capability) and not self.tool_is_placeholder(capability)
+
+    def problems(self) -> list[str]:
+        out = []
+        if not self.verified:
+            out.append(f"profile '{self.name}' is not marked verified")
+        out += [f"{c}: placeholder tool {self.tool_for(c)}" for c in self.capabilities if self.tool_is_placeholder(c)]
+        return out
+
 
 class ProfileError(Exception):
     pass
 
 
 def load_profile(name_or_path: str, allowed_roots: list[Path] | None = None) -> HostProfile:
-    """Load a built-in profile by name, or a JSON file (which must be under an allowed root)."""
-    if name_or_path in BUILTIN_PROFILES:
-        text = resources.files("coded_autonomous_qa.profiles").joinpath(f"{name_or_path}.json").read_text()
-        return HostProfile(**json.loads(text), source=f"builtin:{name_or_path}")
-    path = Path(name_or_path).expanduser().resolve()
-    if allowed_roots is not None and not any(path.is_relative_to(r.resolve()) for r in allowed_roots):
-        raise ProfileError(f"Profile {path} is outside the allowed roots.")
-    if not path.is_file():
-        raise ProfileError(f"Host profile not found: {name_or_path} (built-ins: {', '.join(BUILTIN_PROFILES)}).")
-    data = json.loads(path.read_text())
-    return HostProfile(**data, source=str(path))
+    """Load a built-in profile by name, or a JSON file (which must be under an allowed root).
+
+    Raises :class:`ProfileError` for anything wrong — callers must not substitute another profile.
+    """
+    try:
+        if name_or_path in BUILTIN_PROFILES:
+            text = resources.files("coded_autonomous_qa.profiles").joinpath(f"{name_or_path}.json").read_text()
+            return HostProfile(**json.loads(text), source=f"builtin:{name_or_path}")
+        path = Path(name_or_path).expanduser().resolve()
+        if allowed_roots is not None and not any(path.is_relative_to(r.resolve()) for r in allowed_roots):
+            raise ProfileError(f"Profile {path} is outside the allowed roots.")
+        if not path.is_file():
+            raise ProfileError(f"Host profile not found: {name_or_path} (built-ins: {', '.join(BUILTIN_PROFILES)}).")
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ProfileError(f"Host profile {path} must be a JSON object.")
+        data.pop("source", None)
+        return HostProfile(**data, source=str(path))
+    except json.JSONDecodeError as exc:
+        raise ProfileError(f"Host profile {name_or_path} is not valid JSON: {exc}") from exc
+    except (ValidationError, TypeError) as exc:
+        raise ProfileError(f"Host profile {name_or_path} is invalid: {exc}") from exc
 
 
 def _fill(template: Any, values: dict[str, Any]) -> Any:
@@ -103,87 +157,93 @@ def _has_secret(value: Any) -> bool:
     return "${secret:" in json.dumps(value, default=str)
 
 
-def _fallback_selector(step: TestStep) -> tuple[str | None, str]:
-    """A Playwright selector when none is known; always labelled as inferred."""
-    target = (step.target or "").strip()
-    if not target:
-        return None, "none"
-    quoted = target.replace('"', '\\"')
-    if step.action in (StepAction.FILL, StepAction.SELECT):
-        if re.fullmatch(r"[A-Za-z_][\w.\-]*", target):
-            return f'[name="{quoted}"], [id="{quoted}"]', "inferred:name_or_id"
-        return f'internal:label="{quoted}"i', "inferred:label"
-    if step.action is StepAction.CHECK:
-        return f'internal:label="{quoted}"i', "inferred:label"
-    # Only clickable elements: a bare text= selector also matches headings and paragraphs
-    # (e.g. an <h1>Sign in</h1> above the "Sign in" button), so the click would land on text.
-    clickable = ", ".join(
-        [
-            f'button:has-text("{quoted}")',
-            f'a:has-text("{quoted}")',
-            f'[role=button]:has-text("{quoted}")',
-            f'[role=link]:has-text("{quoted}")',
-            f'[role=tab]:has-text("{quoted}")',
-            f'[role=menuitem]:has-text("{quoted}")',
-            f'input[type=submit][value="{quoted}"]',
-            f'input[type=button][value="{quoted}"]',
-        ]
-    )
-    return clickable, "inferred:clickable_text"
-
-
 class ActionPlanner:
     """Turns server intentions into host action requests using a profile."""
 
-    def __init__(self, profile: HostProfile) -> None:
+    def __init__(self, profile: HostProfile, resolve_url: Callable[[str, str], str] | None = None) -> None:
         self.profile = profile
+        # (target, base_url) -> validated absolute URL; raises SafetyError
+        self._resolve_url = resolve_url
+
+    def _url(self, target: str, base: str | None) -> str:
+        if self._resolve_url is None:
+            raise SafetyError("No navigation resolver configured.", code="invalid_url")
+        return self._resolve_url(target, base or target)
 
     def _request(self, capability: str, values: dict[str, Any], purpose: str, **extra: Any) -> ActionRequest:
         spec = self.profile.capabilities.get(capability)
         if spec is None:
-            return ActionRequest(
-                capability=capability,
-                host_tool=None,
-                arguments=values,
-                purpose=purpose,
-                tool_verified=False,
-                report_hint={
-                    "note": f"Host profile '{self.profile.name}' has no '{capability}' capability; "
-                    "perform it with any equivalent host tool."
-                },
-                **extra,
+            raise SafetyError(
+                f"Host profile '{self.profile.name}' ({self.profile.engine}) has no '{capability}' capability; the "
+                "step cannot be performed with this engine. Add the capability to the profile or choose another "
+                "engine explicitly.",
+                code="unsupported_capability",
+            )
+        if not self.profile.is_executable(capability):
+            raise SafetyError(
+                f"Host tool for '{capability}' in profile '{self.profile.name}' is not verified "
+                f'({spec.get("tool")}). Configure the real host tool name, set "verified": true and point '
+                "CODED_QA_HOST_PROFILE at that profile. Nothing was handed to the host.",
+                code="unverified_host_tool",
             )
         args = _fill(spec.get("arguments", {}), values)
         return ActionRequest(
             capability=capability,
-            host_tool=spec.get("tool"),
+            host_tool=spec["tool"],
             arguments=args,
             purpose=purpose,
             followups=[_fill(f, values) for f in spec.get("followups", [])],
-            tool_verified=self.profile.verified and not self.profile.tool_is_placeholder(capability),
+            tool_verified=True,
+            engine=self.profile.engine,
             contains_secret_refs=_has_secret(args),
             **extra,
         )
 
+    def require(self, capabilities: list[str]) -> None:
+        """Fail before anything is created if any capability is missing or unverified."""
+        for cap in capabilities:
+            if not self.profile.has(cap):
+                raise SafetyError(
+                    f"Host profile '{self.profile.name}' has no '{cap}' capability.", code="unsupported_capability"
+                )
+            if not self.profile.is_executable(cap):
+                raise SafetyError(
+                    f"Host tool for '{cap}' in profile '{self.profile.name}' is not verified "
+                    f"({self.profile.tool_for(cap)}).",
+                    code="unverified_host_tool",
+                )
+
+    def capabilities_for(self, steps: list[TestStep], *, observe: bool = False) -> list[str]:
+        if self.profile.batching == "browser_steps":
+            caps = ["ui.interact"]
+        else:
+            caps = ["ui.navigate"] + [
+                "ui.navigate" if s.action is StepAction.NAVIGATE else f"ui.{s.action.value}" for s in steps
+            ]
+        return sorted(set(caps + (["ui.observe"] if observe else [])))
+
     # --- discovery -----------------------------------------------------------
     def observe(self, url: str, *, purpose: str, report_with: str, report_hint: dict[str, Any]) -> ActionRequest:
-        return self._request("ui.observe", {"url": url}, purpose, report_with=report_with, report_hint=report_hint)
+        return self._request(
+            "ui.observe", {"url": self._url(url, url)}, purpose, report_with=report_with, report_hint=report_hint
+        )
 
     def observe_after(
         self, url: str, steps: list[TestStep], *, purpose: str, report_with: str, report_hint: dict[str, Any]
     ) -> list[ActionRequest]:
         """Navigate, perform ``steps`` (e.g. click a link), then observe the resulting screen."""
+        self.require(self.capabilities_for(steps, observe=True))
         reqs = self.execute_steps(url, steps, purpose=purpose, report_with=report_with, report_hint=report_hint)
         if self.profile.batching == "per_step":
-            reqs.append(
-                self.observe(
-                    url, purpose="Observe the resulting screen.", report_with=report_with, report_hint=report_hint
-                )
+            obs = self.observe(
+                url, purpose="Observe the resulting screen.", report_with=report_with, report_hint=report_hint
             )
-            reqs[-1].arguments.pop("url", None)
+            obs.arguments.pop("url", None)
+            reqs.append(obs)
         else:
+            followups = self.profile.capabilities["ui.observe"].get("followups", [])
             for r in reqs:
-                r.followups = self.profile.capabilities.get("ui.observe", {}).get("followups", [])
+                r.followups = followups
         return reqs
 
     # --- execution -----------------------------------------------------------
@@ -196,26 +256,32 @@ class ActionPlanner:
         report_with: str,
         report_hint: dict[str, Any],
     ) -> list[ActionRequest]:
+        self.require(self.capabilities_for(steps))
+        base = self._url(start_url, start_url) if start_url else None
         if self.profile.batching == "browser_steps":
-            return [self._browser_batch(start_url, steps, purpose, report_with, report_hint)]
+            return self._browser_batches(base, steps, purpose, report_with, report_hint)
         reqs: list[ActionRequest] = []
-        if start_url:
+        if base:
             reqs.append(
                 self._request(
                     "ui.navigate",
-                    {"url": start_url},
+                    {"url": base},
                     "Open the start page.",
                     report_with=report_with,
                     report_hint=report_hint,
                 )
             )
         for step in steps:
+            target = target_for_step(step)
             cap = "ui.navigate" if step.action is StepAction.NAVIGATE else f"ui.{step.action.value}"
+            url = self._url(step.value or step.target or "", base) if step.action is StepAction.NAVIGATE else ""
+            selector, source = to_playwright_selector(target, step.action)
             values = {
-                "target": step.target or "",
+                "target": to_description(target, step.action) or (step.target or ""),
+                "selector": selector or "",
                 "value": step.value or "",
                 "expected": step.expected or "",
-                "url": step.value or step.target or "",
+                "url": url,
             }
             req = self._request(
                 cap,
@@ -225,33 +291,40 @@ class ActionPlanner:
                 report_hint={**report_hint, "step_id": step.id},
                 step_ids=[step.id],
             )
+            if selector:
+                req.selector_sources[step.id] = source
             reqs.append(req)
         return reqs
 
-    def _browser_batch(
-        self, start_url: str | None, steps: list[TestStep], purpose: str, report_with: str, report_hint: dict[str, Any]
-    ) -> ActionRequest:
+    def _browser_batches(
+        self, base: str | None, steps: list[TestStep], purpose: str, report_with: str, report_hint: dict[str, Any]
+    ) -> list[ActionRequest]:
+        """One browser call per URL. A navigation step starts a new call (the tool opens one URL per call, in a
+        fresh browser — so cookies/login from earlier calls are not kept, which the request says)."""
         mapping = self.profile.step_actions
-        browser_steps: list[dict[str, Any]] = []
-        sources: dict[str, str] = {}
-        judged: list[dict[str, str]] = []
-        url = start_url
+        batches: list[dict[str, Any]] = []
+        current: dict[str, Any] = {"url": base, "steps": [], "sources": {}, "judged": [], "step_ids": []}
         for step in steps:
             if step.action is StepAction.NAVIGATE:
-                if url is None:
-                    url = step.value or step.target
+                url = self._url(step.value or step.target or "", base)
+                if current["url"] is None:
+                    current["url"] = url
+                    current["step_ids"].append(step.id)
                     continue
-                judged.append(
-                    {
-                        "step_id": step.id,
-                        "instruction": f"navigate to {step.value or step.target} "
-                        "(needs its own browser call: the tool opens one URL per call)",
-                    }
-                )
+                batches.append(current)
+                current = {
+                    "url": url,
+                    "steps": [],
+                    "sources": {},
+                    "judged": [],
+                    "step_ids": [step.id],
+                    "new_session": True,
+                }
                 continue
+            current["step_ids"].append(step.id)
             host_action = mapping.get(step.action.value)
             if host_action is None:
-                judged.append(
+                current["judged"].append(
                     {
                         "step_id": step.id,
                         "instruction": f"{step.action.value}: {step.expected or step.target or ''}".strip(),
@@ -262,24 +335,32 @@ class ActionPlanner:
             if host_action == "wait":
                 entry["value"] = step.value or "1000"
             else:
-                selector, source = (step.selector, "known") if step.selector else _fallback_selector(step)
+                selector, source = to_playwright_selector(target_for_step(step), step.action)
                 if selector:
                     entry["selector"] = selector
-                sources[step.id] = source
+                current["sources"][step.id] = source
                 if step.action is not StepAction.CHECK and step.value is not None:
                     entry["value"] = step.value
-            browser_steps.append(entry)
-        values = {"url": url or "", "steps": browser_steps}
-        req = self._request(
-            "ui.interact",
-            values,
-            purpose,
-            report_with=report_with,
-            report_hint={**report_hint, "judge_from_result": judged},
-            step_ids=[s.id for s in steps],
-        )
-        req.selector_sources = sources
-        return req
+            current["steps"].append(entry)
+        batches.append(current)
+        reqs = []
+        for b in batches:
+            if not b["url"]:
+                raise SafetyError("The test has no start URL to open.", code="invalid_url")
+            hint = {**report_hint, "judge_from_result": b["judged"]}
+            if b.get("new_session"):
+                hint["note"] = "New browser session: state from the previous call (e.g. login) is not kept."
+            req = self._request(
+                "ui.interact",
+                {"url": b["url"], "steps": b["steps"]},
+                purpose,
+                report_with=report_with,
+                report_hint=hint,
+                step_ids=b["step_ids"],
+            )
+            req.selector_sources = b["sources"]
+            reqs.append(req)
+        return reqs
 
     # --- framework integration ----------------------------------------------
     def invoke_skill(self, skill: str, payload: dict[str, Any], *, purpose: str) -> ActionRequest:

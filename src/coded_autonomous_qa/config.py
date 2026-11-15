@@ -88,6 +88,21 @@ def _env_bool(name: str, default: bool) -> bool:
     return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+class BrowserSettings(BaseModel):
+    """Options for the direct engines (Playwright, Selenium)."""
+
+    name: str = Field(
+        default="chromium", description="Playwright chromium|firefox|webkit; Selenium chrome|firefox|edge."
+    )
+    headless: bool = True
+    executable_path: str | None = Field(default=None, description="Browser binary to use instead of the default.")
+    webdriver_path: str | None = Field(default=None, description="Selenium: driver binary (else Selenium Manager).")
+    webdriver_args: list[str] = Field(default_factory=list, description="Selenium: extra driver service arguments.")
+    remote_url: str | None = Field(default=None, description="Selenium: remote WebDriver / Grid URL.")
+    action_timeout_ms: int = 10_000
+    viewport: str = "1280x800"
+
+
 class Settings(BaseModel):
     data_dir: Path
     environment: str = "local"
@@ -108,6 +123,14 @@ class Settings(BaseModel):
     approval_ttl_minutes: int = 120
 
     host_profile: str = Field(default="coded", description="Name or path of the host tool profile.")
+    host_profile_explicit: bool = Field(
+        default=False, description="True when CODED_QA_HOST_PROFILE was set; an invalid explicit profile fails closed."
+    )
+    automation_engine: str | None = Field(
+        default=None,
+        description="coded-browser | pymidsense | playwright | selenium. None: the host profile's engine.",
+    )
+    browser: BrowserSettings = Field(default_factory=lambda: BrowserSettings())
     pom_dirs: list[Path] = Field(default_factory=list)
     test_dirs: list[Path] = Field(default_factory=list)
     test_runner_cmd: list[str] = Field(default_factory=lambda: ["python", "-m", "pytest"])
@@ -176,6 +199,18 @@ def load_settings() -> Settings:
         "test_dirs": _paths(_env_list("TEST_DIRS")),
         "app_db_paths": _paths(_env_list("APP_DB_PATHS")),
         "host_profile": _env("HOST_PROFILE", "coded"),
+        "host_profile_explicit": _env("HOST_PROFILE") is not None,
+        "automation_engine": (_env("AUTOMATION_ENGINE") or "").strip().lower() or None,
+        "browser": BrowserSettings(
+            name=_env("BROWSER", "chromium"),
+            headless=_env_bool("HEADLESS", True),
+            executable_path=_env("BROWSER_EXECUTABLE"),
+            webdriver_path=_env("WEBDRIVER_PATH"),
+            webdriver_args=shlex.split(_env("WEBDRIVER_ARGS") or ""),
+            remote_url=_env("SELENIUM_REMOTE_URL"),
+            action_timeout_ms=int(_env("ACTION_TIMEOUT_MS", "10000")),
+            viewport=_env("VIEWPORT", "1280x800"),
+        ),
         "allow_secret_injection": _env_bool("ALLOW_SECRET_INJECTION", False),
         "log_level": _env("LOG_LEVEL", "INFO"),
         "approval_ttl_minutes": int(_env("APPROVAL_TTL_MINUTES", "120")),

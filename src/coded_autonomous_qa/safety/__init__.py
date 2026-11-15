@@ -4,6 +4,7 @@ from coded_autonomous_qa.safety.guards import (
     destructive_terms,
     require_execution_permission,
     require_test_environment,
+    resolve_navigation_url,
     resolve_readable_path,
     validate_app_url,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "mask_value",
     "require_execution_permission",
     "require_test_environment",
+    "resolve_navigation_url",
     "resolve_readable_path",
     "validate_app_url",
 ]

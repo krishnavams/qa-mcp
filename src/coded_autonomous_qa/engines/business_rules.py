@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from coded_autonomous_qa.engines.context import EngineContext, file_evidence, result
 from coded_autonomous_qa.engines.execution import ExecutionEngine
 from coded_autonomous_qa.engines.explorer import SUBMIT_WORDS
 from coded_autonomous_qa.engines.values import probes_for, valid_value
 from coded_autonomous_qa.knowledge.models import (
+    Assertion,
+    AssertionKind,
     BusinessRule,
+    ElementTarget,
     Evidence,
     EvidenceKind,
     ExecutionState,
@@ -560,7 +564,13 @@ class BusinessRuleEngine:
         for rule in rules[:50]:
             tc = self._probe_case(rule)
             if tc is None:
-                skipped.append({"rule_id": rule.id, "reason": "no automatic probe for this rule type/screen"})
+                skipped.append(
+                    {
+                        "rule_id": rule.id,
+                        "reason": "no machine-checkable probe for this rule type/screen "
+                        "(it can only be confirmed by a person or a host report)",
+                    }
+                )
             else:
                 cases.append(tc)
         if not cases:
@@ -584,7 +594,24 @@ class BusinessRuleEngine:
         )
         return started
 
+    @staticmethod
+    def _field_target(f: FieldObservation | None, fallback: str) -> ElementTarget:
+        if f is None:
+            return ElementTarget(
+                field_name=fallback if re.fullmatch(r"[A-Za-z_][\w.\-]*", fallback) else None, label=fallback
+            )
+        return ElementTarget(
+            css=f.selector,
+            field_name=f.name if re.fullmatch(r"[A-Za-z_][\w.\-]*", f.name) else None,
+            label=f.label,
+            description=f.vision_description,
+        )
+
     def _probe_case(self, rule: BusinessRule) -> TestCase | None:
+        """A probe whose decisive step carries a structured assertion mapped to the rule (rule_assertions).
+
+        Rules whose expectation cannot be expressed as a machine-checkable assertion get no probe: they can be
+        confirmed only by a person or a host report, never verified automatically."""
         if not rule.screen_id:
             return None
         screen = self.ctx.repo.get_screen(rule.screen_id)
@@ -593,55 +620,78 @@ class BusinessRuleEngine:
         submit = next((c for c in obs.controls if SUBMIT_WORDS.search(c.label)), None)
         title = f"Probe: {rule.statement}"[:300]
         steps: list[TestStep] = []
-        if (
-            rule.rule_type
-            in (RuleType.MANDATORY, RuleType.LENGTH, RuleType.RANGE, RuleType.FORMAT, RuleType.ALLOWED_VALUES)
-            and rule.fields
-        ):
+        assertion: Assertion | None = None
+        expected = rule.statement
+        if rule.rule_type in (RuleType.MANDATORY, RuleType.LENGTH, RuleType.RANGE, RuleType.FORMAT) and rule.fields:
             f = fields.get(rule.fields[0])
-            if f is None or submit is None:
+            if f is None or submit is None or f.type in ("select", "radio", "checkbox"):
                 return None
             bad = next((p for p in probes_for(f.model_dump(), include_security=False) if not p.expect_accept), None)
             if bad is None:
                 return None
-            if f.type in ("select", "radio"):
-                steps.append(
-                    TestStep(action=StepAction.SELECT, target=f.label or f.name, value=bad.value, selector=f.selector)
-                )
-            elif f.type != "checkbox":
-                steps.append(
-                    TestStep(action=StepAction.FILL, target=f.label or f.name, value=bad.value, selector=f.selector)
-                )
-            steps.append(TestStep(action=StepAction.CLICK, target=submit.label, selector=submit.selector))
+            target = self._field_target(f, f.name)
             steps.append(
                 TestStep(
-                    action=StepAction.ASSERT,
+                    action=StepAction.FILL,
                     target=f.label or f.name,
-                    expected=f"The input is rejected ({bad.reason}): a validation message is shown for "
-                    f"'{f.label or f.name}' and the form is not accepted.",
+                    value=bad.value,
+                    selector=f.selector,
+                    element=target,
                 )
             )
+            steps.append(
+                TestStep(
+                    action=StepAction.CLICK,
+                    target=submit.label,
+                    selector=submit.selector,
+                    element=ElementTarget(css=submit.selector, name=submit.label, role="button"),
+                )
+            )
+            expected = (
+                f"The input is rejected ({bad.reason}): '{f.label or f.name}' is invalid, its value is "
+                "changed/truncated, or it is flagged aria-invalid."
+            )
+            assertion = Assertion(kind=AssertionKind.INPUT_REJECTED, target=target, value=bad.value)
         elif rule.rule_type in (RuleType.DEPENDENCY, RuleType.CONDITIONAL_VALIDATION) and rule.condition.get("when"):
             ((ctrl, val),) = rule.condition["when"].items()
             cf = fields.get(ctrl)
+            dependent = next((x for x in rule.fields if x != ctrl), None)
+            then = rule.condition.get("then", {})
+            kind = None
+            if "visible" in then:
+                kind = AssertionKind.ELEMENT_VISIBLE if then["visible"] else AssertionKind.ELEMENT_HIDDEN
+            elif "enabled" in then:
+                kind = AssertionKind.ELEMENT_ENABLED if then["enabled"] else AssertionKind.ELEMENT_DISABLED
+            elif "required" in then:
+                kind = AssertionKind.FIELD_REQUIRED if then["required"] else AssertionKind.FIELD_OPTIONAL
+            if kind is None or dependent is None:
+                return None
+            is_box = cf is not None and cf.type == "checkbox"
             steps.append(
                 TestStep(
-                    action=StepAction.CHECK if cf and cf.type == "checkbox" else StepAction.SELECT,
+                    action=StepAction.CHECK if is_box else StepAction.SELECT,
                     target=(cf.label if cf else None) or ctrl,
-                    value=None if cf and cf.type == "checkbox" else val,
+                    value=None if is_box else val,
                     selector=cf.selector if cf else None,
+                    element=self._field_target(cf, ctrl),
                 )
             )
-            steps.append(TestStep(action=StepAction.ASSERT, expected=rule.statement))
+            assertion = Assertion(kind=kind, target=self._field_target(fields.get(dependent), dependent))
         elif rule.rule_type is RuleType.WORKFLOW_TRANSITION:
-            target = self.ctx.repo.get_screen(rule.condition["to"])
+            dest = self.ctx.repo.get_screen(rule.condition["to"])
             label = re.sub(r"^click '|'$", "", rule.condition.get("action", ""))
             steps.append(TestStep(action=StepAction.CLICK, target=label))
-            steps.append(
-                TestStep(action=StepAction.ASSERT, expected=f"The '{target.name}' screen ({target.url}) is shown.")
-            )
+            expected = f"The '{dest.name}' screen ({dest.url}) is shown."
+            assertion = Assertion(kind=AssertionKind.URL_CONTAINS, value=urlsplit(dest.url).path or "/")
         else:
             return None
+        check = TestStep(
+            action=StepAction.ASSERT,
+            target=rule.fields[-1] if rule.fields else None,
+            expected=expected,
+            assertion=assertion,
+        )
+        steps.append(check)
         return TestCase(
             app_id=rule.app_id,
             title=title,
@@ -652,6 +702,7 @@ class BusinessRuleEngine:
             start_url=screen.url,
             steps=steps,
             rule_ids=[rule.id],
+            rule_assertions={rule.id: check.id},
             tags=["rule-probe", rule.rule_type.value],
         )
 

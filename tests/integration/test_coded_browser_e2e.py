@@ -196,6 +196,10 @@ def test_explore_plan_execute_verify_through_coded_browser(services, site, coded
             "browser",
             actual="no welcome message; submission blocked" if rejected else "accepted",
         )
-    assert services.repo.get_rule(mandatory.id).status is RuleStatus.VERIFIED
+    # The host (Coded's browser + the model's judgement) confirmed it, but the server did not evaluate the
+    # assertion itself: the rule stays OBSERVED with host-reported provenance and higher confidence.
+    rule = services.repo.get_rule(mandatory.id)
+    assert rule.status is RuleStatus.OBSERVED
+    assert rule.verification["level"] == "host_reported" and rule.confidence == 0.9
     report = services.nl.generate_execution_report(probe["run_id"])
     assert "PASSED" in report["markdown"]

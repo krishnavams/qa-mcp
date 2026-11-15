@@ -14,6 +14,12 @@ dependencies = [
     "pydantic>=2.6",
 ]
 
+[project.optional-dependencies]
+# Direct automation engines — install only what you use.
+playwright = ["playwright>=1.40"]
+selenium = ["selenium>=4.15"]
+all-engines = ["playwright>=1.40", "selenium>=4.15"]
+
 [project.scripts]
 coded-qa = "coded_autonomous_qa.cli:main"
 

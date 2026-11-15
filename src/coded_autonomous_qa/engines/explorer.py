@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 from coded_autonomous_qa.adapters.code_index import name_similarity, scan_pom_classes
 from coded_autonomous_qa.adapters.framework import locate_skill
@@ -26,14 +26,17 @@ from coded_autonomous_qa.engines.context import (
 from coded_autonomous_qa.knowledge.models import (
     Application,
     Component,
+    ControlObservation,
     Evidence,
     EvidenceKind,
     ExecutionState,
+    FieldObservation,
     NavigationEdge,
     PomReference,
     Screen,
     ScreenObservation,
     StepAction,
+    StepStatus,
     TestStep,
     Workflow,
     new_id,
@@ -84,7 +87,7 @@ class ExplorerEngine:
         return self.ctx.repo.get_application(app_id)
 
     def _same_app_url(self, app: Application, url: str) -> str:
-        url = validate_app_url(url, self.ctx.settings)
+        url = self.ctx.resolve_url(url, app.base_url)
         if urlsplit(url).hostname != urlsplit(app.base_url).hostname:
             raise SafetyError(
                 f"{url} is not on the application's host ({urlsplit(app.base_url).hostname}).", code="foreign_host"
@@ -120,7 +123,10 @@ class ExplorerEngine:
             "screen_ids": [],
             "skipped": [],
         }
-        actions = self._dispatch(run, batch=1)
+        engine = self.ctx.engine()  # fail closed on misconfiguration; never another engine
+        if engine.mode == "direct":
+            return self._explore_direct(run, app, engine.name)
+        actions = self._dispatch(run, batch=1)  # raises before saving if the host tool is not verified
         self.ctx.repo.save_exploration_run(run_id, app.id, run)
         return result(
             ExecutionState.AWAITING_HOST_EXECUTION,
@@ -130,6 +136,85 @@ class ExplorerEngine:
             run_id=run_id,
             action_requests=actions,
             observation_schema=ScreenObservation.model_json_schema(),
+        )
+
+    def _explore_direct(self, run: dict[str, Any], app: Application, engine: str) -> dict[str, Any]:
+        """Exploration performed by a direct engine: navigate, follow, observe the DOM, record."""
+        run["direct"] = engine
+        run_id = run["id"]
+        self.ctx.repo.save_exploration_run(run_id, app.id, run)
+        adapter = self.ctx.direct_adapter(run_id)
+        problems: list[dict[str, str]] = []
+        n = 0
+        with adapter.session():
+            while True:
+                run = self.ctx.repo.get_exploration_run(run_id)
+                if not run["frontier"] or len(run["screen_ids"]) >= run["max_screens"]:
+                    break
+                item = run["frontier"].pop(0)
+                pending_id = new_id("pend")
+                run["dispatched"][pending_id] = item
+                self.ctx.repo.save_exploration_run(run_id, app.id, run)
+
+                def drop(reason: str, item: dict[str, Any] = item, pid: str = pending_id) -> None:
+                    r = self.ctx.repo.get_exploration_run(run_id)
+                    r["dispatched"].pop(pid, None)
+                    self.ctx.repo.save_exploration_run(run_id, app.id, r)
+                    problems.append({"url": item["url"], "via": item.get("via_action") or "", "reason": reason})
+
+                adapter.reset()
+                try:
+                    adapter.navigate(item["url"])
+                except Exception as exc:
+                    drop(f"could not open: {exc}")
+                    continue
+                failed = None
+                for st in item["steps"]:
+                    out = adapter.run_step(
+                        TestStep(**st),
+                        base_url=item["url"],
+                        resolve_url=lambda t, b=item["url"]: self.ctx.resolve_url(t, b),
+                        shot_name=f"explore_{n:03d}_step",
+                    )
+                    if out.status is not StepStatus.PASSED:
+                        failed = out.error or out.status.value
+                        break
+                if failed:
+                    drop(failed)
+                    continue
+                data = adapter.observe()
+                n += 1
+                obs = ScreenObservation(
+                    url=data["url"],
+                    title=data.get("title") or None,
+                    headings=data.get("headings", []),
+                    fields=[FieldObservation(**f) for f in data.get("fields", [])],
+                    controls=[ControlObservation(**c) for c in data.get("controls", [])],
+                    messages=data.get("messages", []),
+                    visible_text_excerpt=data.get("visible_text_excerpt"),
+                    console_errors=data.get("console_errors", []),
+                    failed_requests=data.get("failed_requests", []),
+                    screenshot_path=adapter.screenshot(f"explore_{n:03d}"),
+                    source_tool=engine,
+                )
+                try:
+                    self.record_screen_observation(app.id, obs, run_id, pending_id)
+                except SafetyError as exc:
+                    drop(f"{exc.code}: {exc}")
+        run = self.ctx.repo.get_exploration_run(run_id)
+        run["status"] = "completed"
+        limit = len(run["screen_ids"]) >= run["max_screens"]
+        run["completed_reason"] = "screen limit reached" if limit else "frontier exhausted"
+        self.ctx.repo.save_exploration_run(run_id, app.id, run)
+        return result(
+            ExecutionState.RECORDED,
+            f"Explored by the server with {engine}: {len(run['screen_ids'])} screen(s) observed from the live DOM "
+            f"({run['completed_reason']}); {len(problems)} link(s) could not be followed.",
+            run_id=run_id,
+            engine=engine,
+            screens=[self._screen_summary(self.ctx.repo.get_screen(sid)) for sid in run["screen_ids"]],
+            problems=problems,
+            skipped_controls=run["skipped"][-20:],
         )
 
     def _dispatch(self, run: dict[str, Any], batch: int = 3) -> list[dict[str, Any]]:
@@ -211,6 +296,9 @@ class ExplorerEngine:
             run["screen_ids"].append(screen.id)
         self._expand_frontier(run, app, screen, obs)
         limit_reached = len(run["screen_ids"]) >= run["max_screens"]
+        if run.get("direct"):  # the direct loop drives itself and decides completion
+            self.ctx.repo.save_exploration_run(run["id"], app.id, run)
+            return result(ExecutionState.RECORDED, "Observation stored.", run_id=run["id"], **out)
         actions = [] if limit_reached else self._dispatch(run)
         if limit_reached or (not actions and not run["dispatched"]):
             run["status"] = "completed"
@@ -279,11 +367,8 @@ class ExplorerEngine:
                 run["skipped"].append({"control": label, "screen": screen.name, "reason": f"destructive ({hits[0]})"})
                 continue
             if control.href:
-                target = urljoin(obs.url, control.href)
-                if urlsplit(target).scheme not in ("http", "https"):
-                    continue
-                try:
-                    target = self._same_app_url(app, target)
+                try:  # every link target goes through the single navigation resolver
+                    target = self._same_app_url(app, self.ctx.resolve_url(control.href, obs.url))
                 except SafetyError as exc:
                     run["skipped"].append({"control": label, "screen": screen.name, "reason": exc.code})
                     continue

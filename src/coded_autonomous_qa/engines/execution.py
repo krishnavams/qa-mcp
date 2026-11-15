@@ -13,11 +13,13 @@ import shlex
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from coded_autonomous_qa.adapters.browser import AdapterError, StepOutcome, assertion_for_step
 from coded_autonomous_qa.adapters.framework import ResultParseError, parse_junit_xml
 from coded_autonomous_qa.engines.context import EngineContext, file_evidence, result
 from coded_autonomous_qa.knowledge.models import (
     Approval,
     ApprovalStatus,
+    AssertionKind,
     BusinessRule,
     Evidence,
     EvidenceKind,
@@ -29,6 +31,8 @@ from coded_autonomous_qa.knowledge.models import (
     TestCase,
     TestPlan,
     TestRun,
+    TestStep,
+    VerificationLevel,
     stable_hash,
     utcnow,
 )
@@ -37,9 +41,8 @@ from coded_autonomous_qa.safety.guards import (
     destructive_terms,
     require_execution_permission,
     resolve_readable_path,
-    validate_app_url,
 )
-from coded_autonomous_qa.safety.masking import mask_text
+from coded_autonomous_qa.safety.masking import mask_text, mask_value
 from coded_autonomous_qa.safety.secrets import SecretUnavailable, resolve_secrets
 
 STEP_REPORT_TOOL = "record_step_result"
@@ -170,22 +173,28 @@ class ExecutionEngine:
                 approval_id=pending.id,
                 destructive_terms=destructive,
             )
+        # Every navigation target goes through the single resolver before anything runs (finding B).
+        start_urls: dict[str, str] = {}
         for tc in cases:
-            validate_app_url(tc.start_url or app.base_url, self.ctx.settings)
+            start_urls[tc.id] = self.ctx.resolve_url(tc.start_url or app.base_url, app.base_url)
             for step in tc.steps:
-                if step.action is StepAction.NAVIGATE and (step.value or step.target or "").startswith("http"):
-                    validate_app_url(step.value or step.target or "", self.ctx.settings)
+                if step.action is StepAction.NAVIGATE:
+                    self.ctx.resolve_url(step.value or step.target or "", start_urls[tc.id])
 
+        engine = self.ctx.engine()  # fails closed on unknown/unavailable/mismatched engines
         run = TestRun(
             app_id=app.id, plan_id=plan.id, approval_id=approval.id if approval else None, change_id=change_id
         )
+        if engine.mode == "direct":
+            return self._execute_direct(run, cases, start_urls, engine.name)
+
+        # Host-mediated: build every request first, so an unverified/unsupported tool refuses the whole run
+        # before any run or step record exists (finding A).
         actions, secret_note = [], None
         for tc in cases:
-            for step in tc.steps:
-                self.ctx.repo.save_step_result(StepResult(run_id=run.id, test_case_id=tc.id, step_id=step.id))
             hint = {"run_id": run.id, "test_case_id": tc.id, "report_each_step": True}
             reqs = self.ctx.planner.execute_steps(
-                tc.start_url or app.base_url,
+                start_urls[tc.id],
                 tc.steps,
                 purpose=f"Execute: {tc.title}",
                 report_with=STEP_REPORT_TOOL,
@@ -206,15 +215,149 @@ class ExecutionEngine:
                             "host, or enable injection; values are never stored or logged."
                         )
                 actions.append(req.model_dump())
-        run.summary = {"test_cases": [tc.id for tc in cases], "steps": sum(len(tc.steps) for tc in cases)}
+        for tc in cases:
+            for step in tc.steps:
+                self.ctx.repo.save_step_result(StepResult(run_id=run.id, test_case_id=tc.id, step_id=step.id))
+        run.summary = {
+            "test_cases": [tc.id for tc in cases],
+            "steps": sum(len(tc.steps) for tc in cases),
+            "engine": engine.name,
+            "engine_mode": engine.mode,
+        }
         self.ctx.repo.save_run(run)
         return result(
             ExecutionState.AWAITING_HOST_EXECUTION,
-            f"Run {run.id} created with {run.summary['steps']} step(s). Nothing has executed yet: perform the action "
-            f"requests with the host tools and report every step with {STEP_REPORT_TOOL}.",
+            f"Run {run.id} created with {run.summary['steps']} step(s) for engine '{engine.name}'. Nothing has "
+            f"executed yet: perform the action requests with the host tools and report every step with "
+            f"{STEP_REPORT_TOOL}. Host reports are recorded as host_reported, never as independently verified.",
             run_id=run.id,
+            engine=engine.name,
             action_requests=actions,
             secret_note=secret_note,
+        )
+
+    # ------------------------------------------------------------------
+    # direct engines (Playwright, Selenium): the server executes and verifies itself
+    # ------------------------------------------------------------------
+    def _execute_direct(
+        self, run: TestRun, cases: list[TestCase], start_urls: dict[str, str], engine: str
+    ) -> dict[str, Any]:
+        adapter = self.ctx.direct_adapter(run.id)
+        run.summary = {
+            "test_cases": [tc.id for tc in cases],
+            "steps": sum(len(tc.steps) for tc in cases),
+            "engine": engine,
+            "engine_mode": "direct",
+        }
+        for tc in cases:
+            for step in tc.steps:
+                self.ctx.repo.save_step_result(StepResult(run_id=run.id, test_case_id=tc.id, step_id=step.id))
+        self.ctx.repo.save_run(run)
+
+        def resolve_value(v: str) -> str:
+            # Secrets are resolved inside the server process only, at the moment of typing; never stored.
+            try:
+                return resolve_secrets(v)
+            except SecretUnavailable as exc:
+                raise AdapterError(str(exc)) from exc
+
+        try:
+            adapter.start()
+        except Exception as exc:
+            msg = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            for r in self.ctx.repo.list_step_results(run.id):
+                self._save_direct(
+                    r,
+                    StepOutcome(
+                        StepStatus.BLOCKED, VerificationLevel.UNVERIFIED, error=f"{engine} could not start: {msg}"
+                    ),
+                    engine,
+                    None,
+                )
+            return self._finish_run(self.ctx.repo.get_run(run.id), self.ctx.repo.list_step_results(run.id))
+        try:
+            session = adapter.describe()
+            run.summary["session"] = session
+            self.ctx.repo.save_run(run)
+            pending = {r.step_id: r for r in self.ctx.repo.list_step_results(run.id)}
+            for tc in cases:
+                adapter.reset()
+                base = start_urls[tc.id]
+                failed_at: str | None = None
+                try:
+                    adapter.navigate(base)
+                except Exception as exc:
+                    failed_at = f"could not open start URL {base}: {exc}"
+                for i, step in enumerate(tc.steps):
+                    if failed_at:
+                        out = StepOutcome(
+                            StepStatus.BLOCKED, VerificationLevel.UNVERIFIED, error=f"Not run: {failed_at}"
+                        )
+                    else:
+                        out = adapter.run_step(
+                            step,
+                            base_url=base,
+                            resolve_value=resolve_value,
+                            resolve_url=lambda t, b=base: self.ctx.resolve_url(t, b),
+                            shot_name=f"{tc.id}_{i:02d}_{step.action.value}",
+                        )
+                        if out.status in (StepStatus.FAILED, StepStatus.BLOCKED):
+                            failed_at = f"step {i + 1} ({step.action.value}) did not pass"
+                    self._save_direct(pending[step.id], out, engine, session)
+        finally:
+            adapter.stop()
+        return self._finish_run(self.ctx.repo.get_run(run.id), self.ctx.repo.list_step_results(run.id))
+
+    def _save_direct(self, rec: StepResult, out: StepOutcome, engine: str, session: dict[str, Any] | None) -> None:
+        provenance = {
+            "reporter": "server",
+            "engine": engine,
+            "session": session,
+            "url": out.url,
+            "duration_ms": out.duration_ms,
+            "notes": out.notes,
+        }
+        evidence = [
+            Evidence(
+                kind=EvidenceKind.EXECUTION,
+                run_id=rec.run_id,
+                source_tool=engine,
+                verification=out.verification,
+                provenance={**provenance, "assertion": out.assertion_result},
+                summary=mask_text(f"{out.status.value}: {out.actual or ''} {out.error or ''}".strip())[:4000],
+            )
+        ]
+        if out.screenshot_path and (
+            shot := file_evidence(
+                self.ctx,
+                out.screenshot_path,
+                kind=EvidenceKind.SCREENSHOT,
+                summary="engine screenshot after step",
+                source_tool=engine,
+                run_id=rec.run_id,
+            )
+        ):
+            evidence.append(shot)
+        if out.console_errors or out.network_failures:
+            log = "\n".join(
+                [*(f"console: {c}" for c in out.console_errors), *(f"network: {n}" for n in out.network_failures)]
+            )
+            evidence.append(
+                Evidence(kind=EvidenceKind.LOG, summary=mask_text(log)[:4000], run_id=rec.run_id, source_tool=engine)
+            )
+        self.ctx.repo.save_step_result(
+            rec.model_copy(
+                update={
+                    "status": out.status,
+                    "actual": mask_text(out.actual or "")[:4000] or None,
+                    "error": mask_text(out.error or "")[:4000] or None,
+                    "evidence": evidence,
+                    "recorded_at": utcnow(),
+                    "verification": out.verification,
+                    "provenance": provenance,
+                    "assertion_result": mask_value(out.assertion_result) if out.assertion_result else None,
+                }
+            )
         )
 
     def record_step_result(
@@ -236,11 +379,25 @@ class ExecutionEngine:
             raise SafetyError(f"Step {step_id} is not part of run {run_id}.", code="unknown_step")
         if status is StepStatus.PENDING:
             raise SafetyError("Report a final status (passed, failed, blocked, skipped).", code="invalid_status")
+        if run.summary.get("engine_mode") == "direct":
+            raise SafetyError(
+                "This run was executed by a direct engine; host reports are not accepted.", code="run_not_host_mediated"
+            )
+        step = self._step(pending[step_id].test_case_id, step_id)
+        assertion_check = self._check_host_assertion(step, status, actual)
+        provenance = {
+            "reporter": "host",
+            "source_tool": source_tool,
+            "recorded_via": STEP_REPORT_TOOL,
+            "assertion_check": assertion_check,
+        }
         evidence = [
             Evidence(
                 kind=EvidenceKind.EXECUTION,
                 run_id=run_id,
                 source_tool=source_tool,
+                verification=VerificationLevel.HOST_REPORTED,
+                provenance=provenance,
                 summary=mask_text(f"{status.value}: {actual or ''} {error or ''}".strip())[:4000],
             )
         ]
@@ -266,6 +423,8 @@ class ExecutionEngine:
                 "error": mask_text(error or "")[:4000] or None,
                 "evidence": evidence,
                 "recorded_at": utcnow(),
+                "verification": VerificationLevel.HOST_REPORTED,
+                "provenance": provenance,
             }
         )
         self.ctx.repo.save_step_result(rec)
@@ -282,10 +441,53 @@ class ExecutionEngine:
             )
         return self._finish_run(run, results)
 
+    def _step(self, test_case_id: str, step_id: str) -> TestStep | None:
+        return next((s for s in self.ctx.repo.get_test_case(test_case_id).steps if s.id == step_id), None)
+
+    @staticmethod
+    def _check_host_assertion(step: TestStep | None, status: StepStatus, actual: str | None) -> dict[str, Any]:
+        """Assertion-specific evidence for host-reported results.
+
+        A host may only report an assertion step as PASSED together with what it observed (``actual``). When the
+        step has a text/URL/title assertion, the reported observation must be consistent with it — a PASS that
+        contradicts its own evidence is refused. This is still host-reported evidence, never independent."""
+        if step is None or (
+            step.action not in (StepAction.ASSERT, StepAction.OBSERVE)
+            and not (step.action is StepAction.WAIT and step.expected)
+        ):
+            return {"applies": False}
+        if status is not StepStatus.PASSED:
+            return {"applies": True, "checked": False}
+        if not (actual or "").strip():
+            raise SafetyError(
+                "A PASSED assertion step must include `actual`: what was observed that satisfies the expectation.",
+                code="assertion_evidence_required",
+            )
+        assertion = assertion_for_step(step)
+        if assertion is None or assertion.kind not in (
+            AssertionKind.TEXT_VISIBLE,
+            AssertionKind.TEXT_ABSENT,
+            AssertionKind.URL_CONTAINS,
+            AssertionKind.TITLE_CONTAINS,
+        ):
+            return {"applies": True, "checked": False, "reason": "no text-checkable assertion"}
+        norm = lambda t: " ".join((t or "").lower().split())  # noqa: E731
+        present = norm(assertion.value) in norm(actual)
+        consistent = not present if assertion.kind is AssertionKind.TEXT_ABSENT else present
+        if not consistent and assertion.kind is not AssertionKind.TEXT_ABSENT:
+            raise SafetyError(
+                f"Reported PASS is not supported by the reported observation: expected {assertion.kind.value} "
+                f"{assertion.value!r}, but `actual` does not contain it.",
+                code="assertion_evidence_mismatch",
+            )
+        return {"applies": True, "checked": True, "assertion": assertion.model_dump(), "consistent": consistent}
+
     def _finish_run(self, run: TestRun, results: list[StepResult]) -> dict[str, Any]:
         counts = {s.value: 0 for s in StepStatus}
+        verification = {v.value: 0 for v in VerificationLevel}
         for r in results:
             counts[r.status.value] += 1
+            verification[r.verification.value] += 1
         if counts["failed"]:
             outcome = "failed"
         elif counts["blocked"] or counts["skipped"]:
@@ -301,64 +503,137 @@ class ExecutionEngine:
             failed = any(r.status in (StepStatus.FAILED, StepStatus.BLOCKED) for r in rs)
             self._update_history(tc_id, "failed" if failed else "passed", 0.0)
             rule_updates += self._update_rules(tc, rs, run.id)
+        assertion_steps = [
+            r
+            for r in results
+            if (st := self._step(r.test_case_id, r.step_id)) is not None
+            and st.action in (StepAction.ASSERT, StepAction.OBSERVE)
+        ]
+        independently = bool(assertion_steps) and all(
+            r.status is StepStatus.PASSED and r.verification is VerificationLevel.INDEPENDENTLY_VERIFIED
+            for r in assertion_steps
+        )
+        if outcome != "passed":
+            pass_basis = None
+        elif independently:
+            pass_basis = VerificationLevel.INDEPENDENTLY_VERIFIED.value
+        elif any(r.verification is VerificationLevel.HOST_REPORTED for r in results):
+            pass_basis = VerificationLevel.HOST_REPORTED.value
+        else:
+            pass_basis = VerificationLevel.ENGINE_CONFIRMED.value if not assertion_steps else "unverified"
+        direct = run.summary.get("engine_mode") == "direct"
         run = run.model_copy(
             update={
                 "state": ExecutionState.EXECUTED,
                 "outcome": outcome,
                 "finished_at": utcnow(),
-                "summary": {**run.summary, "step_counts": counts},
+                "summary": {
+                    **run.summary,
+                    "step_counts": counts,
+                    "verification_counts": verification,
+                    "pass_basis": pass_basis,
+                },
             }
         )
         self.ctx.repo.save_run(run)
+        who = f"executed by the server with {run.summary.get('engine')}" if direct else "reported by the host"
+        basis = f" Pass basis: {pass_basis}." if pass_basis else ""
         return result(
             ExecutionState.EXECUTED,
-            f"All steps reported by the host. Outcome: {outcome}.",
+            f"All steps {who}. Outcome: {outcome}.{basis}",
             run_id=run.id,
             outcome=outcome,
+            pass_basis=pass_basis,
             step_counts=counts,
+            verification_counts=verification,
             rule_updates=rule_updates,
         )
 
     def _update_rules(self, tc: TestCase, results: list[StepResult], run_id: str) -> list[dict[str, Any]]:
-        """Executed rule probes move rules to verified/refuted; anything else stays as it was."""
-        updates = []
-        if not tc.rule_ids:
-            return updates
-        steps = {s.id: s for s in tc.steps}
-        all_passed = all(r.status is StepStatus.PASSED for r in results)
-        assertion_failed = any(
-            r.status is StepStatus.FAILED
-            and steps.get(r.step_id) is not None
-            and steps[r.step_id].action in (StepAction.ASSERT, StepAction.OBSERVE, StepAction.WAIT)
-            for r in results
-        )
+        """Decide rules from their *mapped assertion step* only (finding E).
+
+        * independently verified assertion passed (and every earlier step passed) -> VERIFIED
+        * independently verified assertion failed (earlier steps passed)           -> REFUTED
+        * host-reported pass/fail -> status unchanged; confidence nudged; provenance recorded
+        * no mapped assertion, or the probe did not reach it                      -> inconclusive, unchanged
+        """
+        updates: list[dict[str, Any]] = []
+        by_step = {r.step_id: r for r in results}
+        order = [s.id for s in tc.steps]
         for rule_id in tc.rule_ids:
             try:
                 rule = self.ctx.repo.get_rule(rule_id)
             except KeyError:
                 continue
+            step_id = tc.rule_assertions.get(rule_id)
+            step = self._step(tc.id, step_id) if step_id else None
+            res = by_step.get(step_id or "")
+            if step is None or res is None or assertion_for_step(step) is None:
+                updates.append(
+                    {
+                        "rule_id": rule_id,
+                        "status": rule.status.value,
+                        "verdict": "not verifiable: the probe has no mapped, machine-checkable assertion",
+                    }
+                )
+                continue
+            before = order[: order.index(step_id)]
+            reached = all(by_step[s].status is StepStatus.PASSED for s in before if s in by_step)
+            level = res.verification
+            provenance = {
+                "level": level.value,
+                "run_id": run_id,
+                "test_case_id": tc.id,
+                "step_id": step_id,
+                "assertion": assertion_for_step(step).model_dump(),
+                "engine": res.provenance.get("engine"),
+                "reporter": res.provenance.get("reporter"),
+                "observed": (res.assertion_result or {}).get("observed"),
+                "at": utcnow(),
+            }
+            status, confidence = rule.status, rule.confidence
+            if not reached or res.status not in (StepStatus.PASSED, StepStatus.FAILED):
+                verdict = "inconclusive: the probe did not reach its assertion"
+            elif level is VerificationLevel.INDEPENDENTLY_VERIFIED:
+                if res.status is StepStatus.PASSED:
+                    status, confidence, verdict = RuleStatus.VERIFIED, max(confidence, 0.95), "verified"
+                else:
+                    status, confidence, verdict = RuleStatus.REFUTED, max(confidence, 0.9), "refuted"
+            elif res.status is StepStatus.PASSED:
+                confidence = min(0.9, round(confidence + 0.1, 2))
+                verdict = "host-reported confirmation (not independently verified; status unchanged)"
+            else:
+                confidence = max(0.05, round(confidence - 0.2, 2))
+                verdict = "host-reported contradiction (not independently verified; status unchanged)"
+            provenance["verdict"] = verdict
             ev = Evidence(
                 kind=EvidenceKind.EXECUTION,
                 run_id=run_id,
-                source_tool="host",
-                summary=f"Probe '{tc.title}': " + ", ".join(f"{r.status.value}" for r in results),
+                source_tool=res.provenance.get("engine") or res.provenance.get("source_tool") or "host",
+                verification=level,
+                provenance=provenance,
+                summary=mask_text(f"Rule probe '{tc.title}': assertion {res.status.value} ({level.value})")[:4000],
             )
-            if all_passed:
-                status, verdict = RuleStatus.VERIFIED, "verified"
-            elif assertion_failed:
-                status, verdict = RuleStatus.REFUTED, "refuted"
-            else:
-                status, verdict = rule.status, "inconclusive (probe did not reach its assertion)"
             rule = BusinessRule.model_validate(
                 {
                     **rule.model_dump(),
                     "status": status,
+                    "confidence": confidence,
                     "evidence": [*rule.evidence, ev.model_dump()][-25:],
+                    "verification": provenance,
                     "updated_at": utcnow(),
                 }
             )
             self.ctx.repo.save_rule(rule)
-            updates.append({"rule_id": rule_id, "verdict": verdict, "status": rule.status.value})
+            updates.append(
+                {
+                    "rule_id": rule_id,
+                    "verdict": verdict,
+                    "status": rule.status.value,
+                    "confidence": rule.confidence,
+                    "level": level.value,
+                }
+            )
         return updates
 
     def _update_history(

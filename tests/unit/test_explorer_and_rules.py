@@ -133,7 +133,8 @@ class TestBusinessRules:
         out = svc.rules.verify_business_rules(app)
         assert out["execution_state"] == "planned" and "discovery mode" in out["message"]
 
-    def test_executed_probe_verifies_or_refutes(self, services):
+    def test_host_reported_probe_never_verifies(self, services):
+        """Finding E: host-reported passes change confidence and provenance, never the status."""
         app = register(services)
         services.explorer.record_screen_observation(app, login_observation())
         services.rules.discover_business_rules(app)
@@ -155,9 +156,15 @@ class TestBusinessRules:
                 r.step_id,
                 StepStatus.FAILED if failed else StepStatus.PASSED,
                 "browser",
-                actual="51 characters accepted" if failed else "ok",
+                actual="51 characters accepted" if failed else "field flagged invalid",
             )
         assert last["execution_state"] == ExecutionState.EXECUTED.value
-        verdicts = {u["rule_id"]: u["status"] for u in last["rule_updates"]}
-        assert verdicts == {mandatory.id: "verified", length.id: "refuted"}
-        assert services.repo.get_rule(mandatory.id).status is RuleStatus.VERIFIED
+        assert last["pass_basis"] is None  # one assertion failed
+        updates = {u["rule_id"]: u for u in last["rule_updates"]}
+        assert updates[mandatory.id]["status"] == "observed" and updates[mandatory.id]["level"] == "host_reported"
+        assert "not independently verified" in updates[mandatory.id]["verdict"]
+        assert updates[length.id]["status"] == "observed"
+        m = services.repo.get_rule(mandatory.id)
+        assert m.status is RuleStatus.OBSERVED and m.confidence == 0.9  # 0.85 + 0.1, capped at 0.9 for host reports
+        assert m.verification["level"] == "host_reported" and m.verification["reporter"] == "host"
+        assert services.repo.get_rule(length.id).confidence < length.confidence

@@ -65,6 +65,21 @@ class EvidenceKind(StrEnum):
     AI_INFERENCE = "ai_inference"  # reasoning only — never sufficient for verification
 
 
+class VerificationLevel(StrEnum):
+    """Who established a result, and how strongly.
+
+    * ``host_reported``          the host agent said so (its own judgement of tool output)
+    * ``engine_confirmed``       a direct engine performed the action without error
+    * ``independently_verified`` the server evaluated a structured assertion itself and kept the evidence
+    * ``unverified``             nothing checked it (not run, or no machine-checkable assertion)
+    """
+
+    HOST_REPORTED = "host_reported"
+    ENGINE_CONFIRMED = "engine_confirmed"
+    INDEPENDENTLY_VERIFIED = "independently_verified"
+    UNVERIFIED = "unverified"
+
+
 class Evidence(Strict):
     kind: EvidenceKind
     summary: str = Field(max_length=4000)
@@ -74,6 +89,8 @@ class Evidence(Strict):
     run_id: str | None = None
     captured_at: str = Field(default_factory=utcnow)
     file_verified: bool = Field(default=False, description="True when the server hashed the referenced file.")
+    verification: VerificationLevel | None = Field(default=None, description="Set on execution evidence.")
+    provenance: dict[str, Any] = Field(default_factory=dict, description="Reporter, engine, session, assertion.")
 
 
 # ---------------------------------------------------------------------------
@@ -228,14 +245,24 @@ class BusinessRule(Strict):
     source: str = Field(description="heuristic | observation | ai | human | execution")
     evidence: list[Evidence] = Field(default_factory=list)
     key: str = Field(description="Dedup key: same rule discovered twice updates one record.")
+    verification: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Latest verification provenance: level, run_id, step_id, assertion, engine, verdict, at.",
+    )
     created_at: str = Field(default_factory=utcnow)
     updated_at: str = Field(default_factory=utcnow)
 
     @model_validator(mode="after")
     def _truthful_status(self) -> BusinessRule:
         kinds = {e.kind for e in self.evidence}
-        if self.status in (RuleStatus.VERIFIED, RuleStatus.REFUTED) and EvidenceKind.EXECUTION not in kinds:
-            raise ValueError(f"A rule can only be {self.status.value} with execution evidence.")
+        if self.status in (RuleStatus.VERIFIED, RuleStatus.REFUTED) and not any(
+            e.kind is EvidenceKind.EXECUTION and e.verification is VerificationLevel.INDEPENDENTLY_VERIFIED
+            for e in self.evidence
+        ):
+            raise ValueError(
+                f"A rule can only be {self.status.value} with independently verified execution evidence "
+                "(an assertion evaluated by the server); host-reported passes are not enough."
+            )
         if self.status is RuleStatus.OBSERVED and not (kinds - {EvidenceKind.AI_INFERENCE}):
             raise ValueError("An observed rule needs non-AI evidence.")
         if self.source == "ai" and self.status not in (
@@ -266,6 +293,53 @@ class StepAction(StrEnum):
     AI_ACTION = "ai_action"  # free-form step for a vision agent (e.g. PyMidsense ai_act)
 
 
+class ElementTarget(Strict):
+    """Semantic description of an element. Engines resolve it in their own way:
+    Playwright/Selenium locators, a Playwright selector string for Coded's browser tool,
+    or a natural-language description for vision tools (PyMidsense)."""
+
+    role: str | None = Field(default=None, description="ARIA role: button, link, textbox, checkbox, combobox, tab…")
+    name: str | None = Field(default=None, description="Accessible name / visible text of the element.")
+    label: str | None = Field(default=None, description="Text of the associated <label> (form fields).")
+    placeholder: str | None = None
+    text: str | None = Field(default=None, description="Visible text contained in the element.")
+    test_id: str | None = Field(default=None, description="data-testid value.")
+    field_name: str | None = Field(default=None, description="name or id attribute.")
+    css: str | None = Field(default=None, description="Exact CSS selector (from observation or POM).")
+    description: str | None = Field(default=None, description="Natural-language description for vision engines.")
+
+    def is_empty(self) -> bool:
+        return not any(v for v in self.model_dump().values())
+
+
+class AssertionKind(StrEnum):
+    TEXT_VISIBLE = "text_visible"
+    TEXT_ABSENT = "text_absent"
+    ELEMENT_VISIBLE = "element_visible"
+    ELEMENT_HIDDEN = "element_hidden"
+    ELEMENT_ENABLED = "element_enabled"
+    ELEMENT_DISABLED = "element_disabled"
+    FIELD_REQUIRED = "field_required"
+    FIELD_OPTIONAL = "field_optional"
+    INPUT_REJECTED = "input_rejected"
+    INPUT_ACCEPTED = "input_accepted"
+    FIELD_VALUE_EQUALS = "field_value_equals"
+    URL_CONTAINS = "url_contains"
+    TITLE_CONTAINS = "title_contains"
+    NO_CONSOLE_ERRORS = "no_console_errors"
+
+
+class Assertion(Strict):
+    """A machine-checkable expectation. Only these can be independently verified."""
+
+    kind: AssertionKind
+    target: ElementTarget | None = None
+    value: str | None = Field(default=None, max_length=2000)
+    inferred_from_text: bool = Field(
+        default=False, description="Derived heuristically from plain-English expectation text."
+    )
+
+
 class TestStep(Strict):
     __test__ = False  # not a pytest test class
 
@@ -276,6 +350,8 @@ class TestStep(Strict):
     expected: str | None = Field(default=None, max_length=2000)
     selector: str | None = None
     pom_ref: str | None = Field(default=None, description="'ClassName.member' of an existing POM element.")
+    element: ElementTarget | None = Field(default=None, description="Semantic target (derived if omitted).")
+    assertion: Assertion | None = Field(default=None, description="Structured, machine-checkable expectation.")
     destructive: bool = False
 
 
@@ -292,6 +368,9 @@ class TestCase(Strict):
     preconditions: list[str] = Field(default_factory=list)
     steps: list[TestStep]
     rule_ids: list[str] = Field(default_factory=list)
+    rule_assertions: dict[str, str] = Field(
+        default_factory=dict, description="rule_id -> id of the assertion step that decides that rule."
+    )
     tags: list[str] = Field(default_factory=list)
 
 
@@ -325,6 +404,9 @@ class StepResult(Strict):
     error: str | None = None
     evidence: list[Evidence] = Field(default_factory=list)
     recorded_at: str | None = None
+    verification: VerificationLevel = VerificationLevel.UNVERIFIED
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    assertion_result: dict[str, Any] | None = None
 
 
 class TestRun(Strict):

@@ -13,11 +13,14 @@ import json
 import re
 from typing import Any
 
+from coded_autonomous_qa.adapters.browser.semantic import parse_assertion, target_for_step, to_playwright_selector
 from coded_autonomous_qa.adapters.code_index import name_similarity
 from coded_autonomous_qa.engines.context import EngineContext, result
 from coded_autonomous_qa.engines.execution import ExecutionEngine
 from coded_autonomous_qa.engines.values import probes_for
 from coded_autonomous_qa.knowledge.models import (
+    Assertion,
+    AssertionKind,
     ExecutionState,
     StepAction,
     StepStatus,
@@ -285,17 +288,41 @@ class NaturalLanguageTestingEngine:
             resolved, ambiguities, _ = self._parse(instruction, app.id)
             parsed_steps = [r["step"] for r in resolved]
         start_url = app.base_url
-        if parsed_steps and parsed_steps[0].action is StepAction.NAVIGATE:
-            nav = parsed_steps[0]
-            if nav.value and nav.value.startswith("http"):
-                start_url = nav.value
-            else:
+        # Navigation: URLs/paths go through the resolver; page names are mapped to known screens, never guessed.
+        for i, nav in enumerate(parsed_steps):
+            if nav.action is not StepAction.NAVIGATE:
+                continue
+            raw = nav.value or nav.target or ""
+            try:
+                url = self.ctx.resolve_url(raw, app.base_url)
+            except SafetyError as exc:
+                if exc.code != "unresolved_navigation" and not re.fullmatch(r"[\w\s'-]+", raw):
+                    raise
                 screen = self._screen_by_name(app.id, nav.target or "")
-                if screen is not None:
-                    start_url = screen.url
-                else:
-                    ambiguities.append(f"Unknown page '{nav.target}'; the run starts at the application base URL.")
+                url = screen.url if screen is not None else None
+                if url is None:
+                    ambiguities.append(
+                        f"Unknown page '{raw}'. "
+                        + (
+                            "The run starts at the application base URL."
+                            if i == 0
+                            else "This navigation cannot run until it names a URL or a known screen."
+                        )
+                    )
+            if url:
+                parsed_steps[i] = nav.model_copy(update={"value": url})
+        if parsed_steps and parsed_steps[0].action is StepAction.NAVIGATE:
+            start_url = parsed_steps[0].value or app.base_url
             parsed_steps = parsed_steps[1:]
+        for i, st in enumerate(parsed_steps):
+            if st.assertion is None and st.action in (StepAction.ASSERT, StepAction.OBSERVE) and st.expected:
+                parsed = parse_assertion(st.expected)
+                if parsed is None:
+                    ambiguities.append(
+                        f"Expectation '{st.expected}' has no machine-checkable form: only a host can judge it, "
+                        "and a direct engine will report the step as blocked."
+                    )
+                parsed_steps[i] = st.model_copy(update={"assertion": parsed})
         positive = TestCase(
             app_id=app.id,
             title=f"{instruction[:120]} (positive)",
@@ -309,21 +336,7 @@ class NaturalLanguageTestingEngine:
         if include_negative:
             cases += self._negative_variants(app.id, positive, include_security, max_negative)
         plan = self.execution.create_plan(app.id, instruction, cases)
-        mapping = [
-            {
-                "step_id": s.id,
-                "action": s.action.value,
-                "target": s.target,
-                "host_capability": "ui.navigate" if s.action is StepAction.NAVIGATE else f"ui.{s.action.value}",
-                "host_tool": self.ctx.profile.tool_for("ui.interact")
-                if self.ctx.profile.batching == "browser_steps"
-                else self.ctx.profile.tool_for(f"ui.{s.action.value}"),
-                "pom_ref": s.pom_ref,
-                "selector": s.selector,
-                "selector_source": "known" if s.selector else "inferred at execution",
-            }
-            for s in positive.steps
-        ]
+        mapping = self._step_mapping(positive.steps)
         return result(
             ExecutionState.PLANNED,
             f"Plan {plan.id}: 1 positive and {len(cases) - 1} negative/boundary case(s). This is a plan only — "
@@ -336,6 +349,43 @@ class NaturalLanguageTestingEngine:
             step_mapping=mapping,
             ambiguities=ambiguities,
         )
+
+    def _step_mapping(self, steps: list[TestStep]) -> list[dict[str, Any]]:
+        """How each step will be performed by the selected engine (no engine is assumed or substituted)."""
+        try:
+            spec = self.ctx.engine()
+            engine, engine_error = spec.name, None
+        except SafetyError as exc:
+            spec, engine, engine_error = None, None, f"{exc.code}: {exc}"
+        out = []
+        for s in steps:
+            target = target_for_step(s)
+            selector, source = to_playwright_selector(target, s.action)
+            row: dict[str, Any] = {
+                "step_id": s.id,
+                "action": s.action.value,
+                "target": s.target,
+                "engine": engine,
+                "semantic_target": target.model_dump(exclude_none=True) if target else None,
+                "assertion": s.assertion.model_dump() if s.assertion else None,
+                "pom_ref": s.pom_ref,
+                "selector": selector,
+                "selector_source": source,
+            }
+            if engine_error:
+                row["engine_error"] = engine_error
+            elif spec is not None and spec.mode == "host_mediated":
+                profile = self.ctx.require_profile()
+                cap = (
+                    "ui.interact"
+                    if profile.batching == "browser_steps"
+                    else ("ui.navigate" if s.action is StepAction.NAVIGATE else f"ui.{s.action.value}")
+                )
+                row.update(
+                    host_capability=cap, host_tool=profile.tool_for(cap), host_tool_verified=profile.is_executable(cap)
+                )
+            out.append(row)
+        return out
 
     def _screen_by_name(self, app_id: str, name: str):
         best, score = None, 0.0
@@ -363,6 +413,11 @@ class NaturalLanguageTestingEngine:
                     TestStep(
                         action=StepAction.ASSERT,
                         target=step.target,
+                        assertion=Assertion(
+                            kind=AssertionKind.INPUT_REJECTED,
+                            target=target_for_step(step.model_copy(update={"action": StepAction.FILL})),
+                            value=probe.value,
+                        ),
                         expected=f"Input is rejected for '{step.target}' ({probe.reason}) with a clear "
                         "validation message; no success state is reached.",
                     )
@@ -395,6 +450,9 @@ class NaturalLanguageTestingEngine:
             f"- Environment: {self.ctx.settings.environment}",
             f"- Execution state: **{run.state.value}**",
             f"- Outcome: **{run.outcome or 'not available'}**",
+            f"- Engine: {run.summary.get('engine', 'n/a')} ({run.summary.get('engine_mode', 'n/a')})",
+            f"- Pass basis: **{run.summary.get('pass_basis') or 'n/a'}** "
+            "(independently_verified = assertions evaluated by the server; host_reported = the host's judgement)",
         ]
         data: dict[str, Any] = {"run": run.model_dump()}
         if run.kind == "existing_tests":
@@ -425,8 +483,8 @@ class NaturalLanguageTestingEngine:
                     "",
                     f"## {tc.title} ({tc.kind})",
                     "",
-                    "| # | Step | Status | Actual | Evidence |",
-                    "|---|------|--------|--------|----------|",
+                    "| # | Step | Status | Verification | Actual | Evidence |",
+                    "|---|------|--------|--------------|--------|----------|",
                 ]
                 for i, r in enumerate(rs, 1):
                     s = steps.get(r.step_id)
@@ -445,12 +503,14 @@ class NaturalLanguageTestingEngine:
                     )
                     lines.append(
                         f"| {i} | {mask_text(desc).replace('|', '/')} | {r.status.value.upper()} | "
+                        f"{r.verification.value} | "
                         f"{mask_text(r.actual or r.error or '').replace('|', '/')[:200]} | {ev} |"
                     )
                 data["test_cases"].append({"test_case": tc.model_dump(), "results": [r.model_dump() for r in rs]})
         lines += [
             "",
-            "_Evidence marked ✓ was hashed by the server; other references are recorded as reported by the host._",
+            "_Evidence marked ✓ was hashed by the server; other references are recorded as reported by the host. "
+            "Only `independently_verified` steps were checked by the server itself._",
         ]
         md = data_path(self.ctx.settings, "reports", f"{run.id}.md")
         md.parent.mkdir(parents=True, exist_ok=True)
