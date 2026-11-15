@@ -64,6 +64,10 @@ LOGIN = """<!doctype html><html><head><title>Bank login</title></head><body>
 </form>
 <p id="msg" role="status"></p>
 <a href="/forgot.html">Forgot password</a> <a href="http://example.org/help">External help</a>
+<a href="http://example.org/tab" target="_blank">Partner portal</a>
+<a href="/forgot.html" target="_blank">Reset in new tab</a>
+<button type="button" onclick="window.open('http://example.org/popup')">Open popup</button>
+<button type="button" onclick="window.open('data:text/html,<h1>phish</h1>')">Data popup</button>
 <img src="/missing.png" alt="">
 <script>
 console.error("boom on load");
@@ -235,6 +239,23 @@ def test_adapter_actions_assertions_and_diagnostics(svc, site, engine):
         assert blocked.status is StepStatus.FAILED and "disallowed" in blocked.error
         with pytest.raises(Exception):  # noqa: B017 - SafetyError from the guard
             adapter.navigate("http://example.org/")
+
+        # Finding 1: new tabs/windows are guarded too — target=_blank and window.open to a disallowed URL fail
+        # the step and the extra tab is closed; an allowed new tab may stay open.
+        start_url = adapter.current_url()
+        for label in ("Partner portal", "Open popup"):
+            escaped = run(step(StepAction.CLICK, label))
+            assert escaped.status is StepStatus.FAILED, (label, escaped)
+            assert "new tab/window" in escaped.error and "closed" in escaped.error
+            assert [u for _, u in adapter._other_pages() if u != "about:blank"] == []
+            assert adapter.current_url() == start_url  # the driven page did not move
+        # Chromium refuses window.open('data:…') itself; whatever the browser does, nothing may stay open on it.
+        run(step(StepAction.CLICK, "Data popup"))
+        assert [u for _, u in adapter._other_pages() if u != "about:blank"] == []
+        internal = run(step(StepAction.CLICK, "Reset in new tab"))
+        assert internal.status is StepStatus.PASSED, internal.error
+        assert next(u for _, u in adapter._other_pages()).endswith("/forgot.html")
+
         moved = run(step(StepAction.CLICK, "Forgot password"))
         assert moved.status is StepStatus.PASSED and moved.url.endswith("/forgot.html")
 

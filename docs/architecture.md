@@ -94,7 +94,7 @@ Every probe test case maps each rule to the one assertion step that decides it (
 
 ## Results and provenance
 
-Every `StepResult` has `verification` (`independently_verified`, `engine_confirmed`, `host_reported`, `unverified`), `provenance` (reporter, engine, browser session, URL, duration) and, for evaluated assertions, `assertion_result` (assertion, observed value, evaluator). Host reports are accepted only for host-mediated runs; a host `PASSED` on an assertion step must include `actual`, and for text/URL/title assertions `actual` must contain the expected value (`assertion_evidence_required` / `assertion_evidence_mismatch`). A run's `pass_basis` states what its pass rests on.
+Every `StepResult` has `verification` (`independently_verified`, `engine_confirmed`, `host_reported`, `unverified`), `provenance` (reporter, engine, browser session, URL, duration) and, for evaluated assertions, `assertion_result` (assertion, observed value, evaluator). Host reports are accepted only for host-mediated runs; a host `PASSED` on an assertion step must include `actual`, and for text-visible/URL/title assertions `actual` must contain the expected value and for text-absent it must not (`assertion_evidence_required` / `assertion_evidence_mismatch`). A run's `pass_basis` states what its pass rests on.
 
 ## Knowledge base
 

@@ -195,6 +195,33 @@ class BrowserAdapter(abc.ABC):
         return console, network
 
     def _check_location(self) -> None:
+        """Every page/window of the session must stay on allowed URLs.
+
+        New tabs/windows (``target=_blank``, ``window.open``) are checked too: one whose destination is not
+        allowed — or whose navigation was blocked — is closed, and the step fails. Only blank pages and pages
+        on allowed hosts may stay open."""
+        closed = []
+        for handle, url in self._other_pages():
+            if url == "about:blank":
+                continue
+            reason = None
+            if url.startswith(("chrome-error:", "data:", "javascript:", "file:", "blob:")) or not url:
+                reason = "blocked or non-http page"
+            else:
+                try:
+                    self.url_guard(url)
+                except Exception as exc:
+                    reason = str(exc)
+            if reason:
+                self._close_page(handle)
+                closed.append(f"{url or '(unknown)'} ({reason})")
+        if closed:
+            # Only the extra tab is affected: the driven page did not move, so it is not "recovered".
+            blocked, self._blocked = self._blocked[:], []
+            target = blocked[0] if blocked else closed[0]
+            raise NavigationBlocked(
+                f"A new tab/window tried to open a disallowed URL ({target}); it was blocked and closed."
+            )
         if self._blocked:
             blocked, self._blocked = self._blocked[:], []
             self._recover()
@@ -209,6 +236,13 @@ class BrowserAdapter(abc.ABC):
 
     def _recover(self) -> None:
         """Return the session to the last allowed page after a blocked navigation."""
+        return None
+
+    def _other_pages(self) -> list[tuple[Any, str]]:
+        """(handle, url) of every tab/window other than the one the adapter drives."""
+        return []
+
+    def _close_page(self, handle: Any) -> None:
         return None
 
     # ------------------------------------------------------------------ steps

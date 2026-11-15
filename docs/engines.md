@@ -106,7 +106,8 @@ One browser per run (`start` → `stop`, always in `finally`), a fresh context p
 | Screenshot per step | full page | viewport |
 | Console errors | `console` (error) + uncaught exceptions | Chrome/Edge `browser` log (SEVERE); not available for Firefox |
 | Network failures | failed requests + HTTP ≥ 400 responses | Chrome/Edge `browser` log, source `network` |
-| Navigation guard | blocked **before** the request (route interception) | detected right after the action; the step fails and the session goes back |
+| Navigation guard (driven page) | blocked **before** the request (context-wide route interception) | detected right after the action; the step fails and the session goes back |
+| New tabs / windows (`target=_blank`, `window.open`) | their first navigation goes through the same context-wide guard before it is sent; any extra page left on a disallowed, error, `data:`/`javascript:`/`file:`/`blob:` URL is closed and the step fails | every new window is inspected as soon as it appears; one on a disallowed or unreadable URL is closed and the step fails (WebDriver cannot block it beforehand) |
 
 ### Supported actions and assertions
 

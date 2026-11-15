@@ -52,23 +52,52 @@ class PlaywrightAdapter(BrowserAdapter):
             self._context.close()
         self._context = self._browser.new_context(viewport=self.viewport)
         self._context.set_default_timeout(self.timeout_ms)
+        # The guard is context-wide: it sees the main-frame navigation of EVERY page, including tabs opened by
+        # target=_blank links or window.open, before the request is sent.
+        self._context.route("**/*", self._route)
+        self._context.on("page", self._watch)
         self.page = self._context.new_page()
-        self.page.on("console", lambda m: self._console.append(f"{m.type}: {m.text}") if m.type == "error" else None)
-        self.page.on("pageerror", lambda e: self._console.append(f"uncaught: {e}"))
-        self.page.on("requestfailed", lambda r: self._network.append(f"{r.method} {r.url} ({r.failure or 'failed'})"))
-        self.page.on(
+        self._console.clear()
+        self._network.clear()
+
+    def _watch(self, page: Any) -> None:
+        page.on("console", lambda m: self._console.append(f"{m.type}: {m.text}") if m.type == "error" else None)
+        page.on("pageerror", lambda e: self._console.append(f"uncaught: {e}"))
+        page.on("requestfailed", lambda r: self._network.append(f"{r.method} {r.url} ({r.failure or 'failed'})"))
+        page.on(
             "response",
             lambda r: (
                 self._network.append(f"{r.request.method} {r.url} -> HTTP {r.status}") if r.status >= 400 else None
             ),
         )
-        self.page.route("**/*", self._route)
-        self._console.clear()
-        self._network.clear()
+
+    def _other_pages(self) -> list[tuple[Any, str]]:
+        out = []
+        for p in self._context.pages if self._context else []:
+            if p is self.page or p.is_closed():
+                continue
+            try:
+                p.wait_for_load_state("domcontentloaded", timeout=min(self.timeout_ms, 3000))
+            except Exception:
+                pass
+            out.append((p, p.url))
+        return out
+
+    def _close_page(self, handle: Any) -> None:
+        try:
+            handle.close()
+        except Exception:
+            pass
 
     def _route(self, route: Any) -> None:
         req = route.request
-        if req.is_navigation_request() and req.frame == self.page.main_frame:
+        top_level = False
+        if req.is_navigation_request():
+            try:
+                top_level = req.frame.parent_frame is None
+            except Exception:
+                top_level = True
+        if top_level:
             try:
                 self.url_guard(req.url)
             except Exception:
@@ -179,6 +208,7 @@ class PlaywrightAdapter(BrowserAdapter):
             self.page.wait_for_load_state("load", timeout=self.timeout_ms)
         except Exception:
             pass
+        self.page.wait_for_timeout(300)  # let a tab opened by this click register before the location check
 
     def _fill(self, el: Any, value: str) -> None:
         el.fill(value)

@@ -473,11 +473,13 @@ class ExecutionEngine:
             return {"applies": True, "checked": False, "reason": "no text-checkable assertion"}
         norm = lambda t: " ".join((t or "").lower().split())  # noqa: E731
         present = norm(assertion.value) in norm(actual)
-        consistent = not present if assertion.kind is AssertionKind.TEXT_ABSENT else present
-        if not consistent and assertion.kind is not AssertionKind.TEXT_ABSENT:
+        absent = assertion.kind is AssertionKind.TEXT_ABSENT
+        consistent = not present if absent else present
+        if not consistent:  # contradictory evidence is refused for every text-checkable kind
+            detail = "contains it, although it was expected to be absent" if absent else "does not contain it"
             raise SafetyError(
                 f"Reported PASS is not supported by the reported observation: expected {assertion.kind.value} "
-                f"{assertion.value!r}, but `actual` does not contain it.",
+                f"{assertion.value!r}, but `actual` {detail}.",
                 code="assertion_evidence_mismatch",
             )
         return {"applies": True, "checked": True, "assertion": assertion.model_dump(), "consistent": consistent}

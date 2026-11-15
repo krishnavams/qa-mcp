@@ -20,14 +20,14 @@ def workspace(tmp_path: Path) -> Path:
 
 
 def make_settings(tmp_path: Path, workspace: Path, mode: PermissionMode = PermissionMode.EXECUTION, **kw) -> Settings:
-    return Settings(
-        data_dir=tmp_path / "data",
-        environment="qa",
-        permission_mode=mode,
-        allowed_hosts=["localhost", "127.0.0.1", "*.qa.example.test"],
-        allowed_roots=[workspace],
-        **kw,
-    )
+    defaults = {
+        "data_dir": tmp_path / "data",
+        "environment": "qa",
+        "permission_mode": mode,
+        "allowed_hosts": ["localhost", "127.0.0.1", "*.qa.example.test"],
+        "allowed_roots": [workspace],
+    }
+    return Settings(**{**defaults, **kw})
 
 
 @pytest.fixture

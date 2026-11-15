@@ -25,6 +25,7 @@ from coded_autonomous_qa.knowledge.models import (
     ControlObservation,
     ElementTarget,
     StepAction,
+    StepStatus,
     TestStep,
 )
 from coded_autonomous_qa.safety.guards import SafetyError, resolve_navigation_url, validate_app_url
@@ -368,3 +369,149 @@ class TestProfiles:
         st = engine_status(svc)
         assert st["selected"]["ready"] is False and st["selected"]["error_code"] == "profile_invalid"
         assert st["registered"]["playwright"]["mode"] == "direct"
+
+
+# ---------------------------------------------------------------------------
+# Review follow-up: malformed URLs and contradictory host evidence
+# ---------------------------------------------------------------------------
+MALFORMED_IPV6 = [
+    "http://[::1/x",
+    "http://[zz]/",
+    "http://::1]/",
+    "http://[::1]x/",
+    "http://[v1.x]/",
+    "https://[127.0.0.1]/",
+    "http://[]/",
+]
+
+
+class TestMalformedUrls:
+    @pytest.mark.parametrize("url", MALFORMED_IPV6)
+    def test_validate_returns_structured_error(self, tmp_path, workspace, url):
+        s = make_settings(tmp_path, workspace, allowed_hosts=["localhost", "::1", "v1.x"])
+        with pytest.raises(SafetyError) as e:  # never a bare ValueError
+            validate_app_url(url, s)
+        assert e.value.code == "invalid_url"
+
+    @pytest.mark.parametrize("target", [*MALFORMED_IPV6, "//[::1/x", "//[zz]/a"])
+    def test_resolver_returns_structured_error(self, tmp_path, workspace, target):
+        s = make_settings(tmp_path, workspace, allowed_hosts=["localhost", "::1"])
+        with pytest.raises(SafetyError) as e:
+            resolve_navigation_url(target, "http://localhost:8080/login", s)
+        assert e.value.code == "invalid_url"
+
+    def test_malformed_base_url(self, tmp_path, workspace):
+        with pytest.raises(SafetyError) as e:
+            resolve_navigation_url("/x", "http://[::1/", make_settings(tmp_path, workspace))
+        assert e.value.code == "invalid_url"
+
+    def test_valid_ipv6_keeps_brackets(self, tmp_path, workspace):
+        s = make_settings(tmp_path, workspace, allowed_hosts=["::1"])
+        assert validate_app_url("http://[::1]:8080/a", s) == "http://[::1]:8080/a"
+        assert resolve_navigation_url("/b", "http://[::1]:8080/a", s) == "http://[::1]:8080/b"
+
+    def test_register_application_with_malformed_url_is_blocked(self, services):
+        with pytest.raises(SafetyError) as e:
+            services.explorer.register_application("A", "http://[::1/x")
+        assert e.value.code == "invalid_url"
+
+
+class TestHostAssertionEvidence:
+    def _run(self, services, expected):
+        app = services.explorer.register_application("A", BASE + "/login")["application"]["id"]
+        plan = services.nl.generate_test_plan(app, f"click Sign in, verify {expected}", include_negative=False)
+        run = services.execution.start_run(plan["plan_id"])
+        results = services.repo.list_step_results(run["run_id"])
+        return run["run_id"], results[0], results[-1]
+
+    def test_text_absent_pass_contradicted_by_observation_is_rejected(self, services):
+        run_id, click, check = self._run(services, "'Error' is not shown")
+        tc = services.repo.get_test_case(check.test_case_id)
+        assert tc.steps[-1].assertion.kind is AssertionKind.TEXT_ABSENT
+        services.execution.record_step_result(run_id, click.step_id, StepStatus.PASSED, "browser", actual="clicked")
+        with pytest.raises(SafetyError) as e:
+            services.execution.record_step_result(
+                run_id, check.step_id, StepStatus.PASSED, "browser", actual="Login page. Error: invalid password"
+            )
+        assert e.value.code == "assertion_evidence_mismatch" and "expected to be absent" in str(e.value)
+        ok = services.execution.record_step_result(
+            run_id, check.step_id, StepStatus.PASSED, "browser", actual="Dashboard. Welcome back"
+        )
+        assert ok["outcome"] == "passed"
+        rec = services.repo.list_step_results(run_id)[-1]
+        assert rec.provenance["assertion_check"]["consistent"] is True
+
+    def test_text_visible_pass_contradicted_by_observation_is_rejected(self, services):
+        run_id, click, check = self._run(services, "'Welcome' is shown")
+        services.execution.record_step_result(run_id, click.step_id, StepStatus.PASSED, "browser", actual="clicked")
+        with pytest.raises(SafetyError) as e:
+            services.execution.record_step_result(
+                run_id, check.step_id, StepStatus.PASSED, "browser", actual="Error: invalid password"
+            )
+        assert e.value.code == "assertion_evidence_mismatch" and "does not contain it" in str(e.value)
+
+    def test_failed_report_with_matching_text_is_accepted(self, services):
+        run_id, click, check = self._run(services, "'Error' is not shown")
+        services.execution.record_step_result(run_id, click.step_id, StepStatus.PASSED, "browser", actual="clicked")
+        out = services.execution.record_step_result(
+            run_id, check.step_id, StepStatus.FAILED, "browser", actual="Error: invalid password"
+        )
+        assert out["outcome"] == "failed"
+
+
+class TestNewWindowGuard:
+    """Base-class contract for new tabs/windows, independent of any browser."""
+
+    def _adapter(self, tmp_path, workspace, pages):
+        from coded_autonomous_qa.adapters.browser.base import BrowserAdapter
+
+        s = make_settings(tmp_path, workspace)
+        closed: list[str] = []
+
+        class Stub(BrowserAdapter):
+            engine = "stub"
+
+            def __init__(self):
+                super().__init__(url_guard=lambda u: validate_app_url(u, s), screenshot_dir=tmp_path)
+                self.pages = dict(pages)
+
+            def _other_pages(self):
+                return list(self.pages.items())
+
+            def _close_page(self, handle):
+                closed.append(handle)
+                self.pages.pop(handle)
+
+            def current_url(self):
+                return "http://localhost/login"
+
+            start = stop = reset = title = _goto = _locate = _count = _click = _fill = _select = _check = (
+                lambda *a, **k: None
+            )
+            _press = _eval_page = _eval_element = _screenshot = start
+
+        return Stub(), closed
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://evil.example/x",
+            "data:text/html,<h1>x</h1>",
+            "javascript:alert(1)",
+            "chrome-error://chromewebdata/",
+            "file:///etc/passwd",
+            "blob:http://x/1",
+        ],
+    )
+    def test_disallowed_new_window_is_closed_and_fails(self, tmp_path, workspace, url):
+        from coded_autonomous_qa.adapters.browser import NavigationBlocked
+
+        adapter, closed = self._adapter(tmp_path, workspace, {"tab2": url, "tab3": "about:blank"})
+        with pytest.raises(NavigationBlocked, match="new tab/window"):
+            adapter._check_location()
+        assert closed == ["tab2"]  # the blank tab is harmless and stays
+
+    def test_allowed_new_window_stays(self, tmp_path, workspace):
+        adapter, closed = self._adapter(tmp_path, workspace, {"tab2": "http://localhost/forgot"})
+        adapter._check_location()
+        assert closed == []
