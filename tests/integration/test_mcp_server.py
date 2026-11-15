@@ -193,3 +193,30 @@ async def test_stdio_subprocess(tmp_path, workspace):
         assert status["permission_mode"] == "discovery" and status["environment"] == "qa"
     assert (tmp_path / "stdio-data" / "knowledge.db").exists()
     assert (tmp_path / "stdio-data" / "logs" / "audit.jsonl").read_text().count("get_server_status") == 1
+
+
+async def test_action_requests_are_not_masked_but_results_are(server):
+    mcp, svc = server
+    async with Client(mcp) as c:
+        app_id = data(await c.call_tool("register_application", {"name": "M", "base_url": BASE + "/login"}))[
+            "application"
+        ]["id"]
+        await c.call_tool(
+            "record_screen_observation", {"app_id": app_id, "observation": login_observation().model_dump()}
+        )
+        sid = svc.repo.list_screens(app_id)[0].id
+        out = data(
+            await c.call_tool(
+                "generate_negative_scenarios", {"app_id": app_id, "screen_id": sid, "execute": True, "limit": 30}
+            )
+        )
+        assert out["execution_state"] == "awaiting_host_execution"
+        typed = [s.get("value") for a in out["action_requests"] for s in a["arguments"]["steps"]]
+        assert "qa.user@example.test" in typed  # the exact value the host must type
+        plan = data(
+            await c.call_tool(
+                "generate_test_plan",
+                {"app_id": app_id, "instruction": "Enter jane.doe@corp.test in Username and verify it is shown"},
+            )
+        )
+        assert "jane.doe@corp.test" not in json.dumps(plan)  # informational output is masked

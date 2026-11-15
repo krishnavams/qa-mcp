@@ -80,6 +80,16 @@ class Services:
         self.regression = RegressionEngine(self.ctx, self.execution)
 
 
+def _mask_output(out: dict[str, Any]) -> dict[str, Any]:
+    """Mask results, except action requests: they are instructions the host must execute verbatim
+    (synthetic test data and ${secret:...} references), and masking them would change what gets typed."""
+    actions = out.get("action_requests")
+    masked = mask_value({k: v for k, v in out.items() if k != "action_requests"})
+    if actions is not None:
+        masked["action_requests"] = actions
+    return masked
+
+
 def _tool_wrapper(
     services: Services, tier: str
 ) -> Callable[[Callable[..., dict[str, Any]]], Callable[..., dict[str, Any]]]:
@@ -153,7 +163,7 @@ def _tool_wrapper(
                     )
             except Exception:
                 log.exception("audit write failed")
-            return mask_value(out) if tier != "execution" else out
+            return _mask_output(out)
 
         return wrapper
 

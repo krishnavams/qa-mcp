@@ -113,7 +113,23 @@ def _fallback_selector(step: TestStep) -> tuple[str | None, str]:
         if re.fullmatch(r"[A-Za-z_][\w.\-]*", target):
             return f'[name="{quoted}"], [id="{quoted}"]', "inferred:name_or_id"
         return f'internal:label="{quoted}"i', "inferred:label"
-    return f'text="{quoted}"', "inferred:text"
+    if step.action is StepAction.CHECK:
+        return f'internal:label="{quoted}"i', "inferred:label"
+    # Only clickable elements: a bare text= selector also matches headings and paragraphs
+    # (e.g. an <h1>Sign in</h1> above the "Sign in" button), so the click would land on text.
+    clickable = ", ".join(
+        [
+            f'button:has-text("{quoted}")',
+            f'a:has-text("{quoted}")',
+            f'[role=button]:has-text("{quoted}")',
+            f'[role=link]:has-text("{quoted}")',
+            f'[role=tab]:has-text("{quoted}")',
+            f'[role=menuitem]:has-text("{quoted}")',
+            f'input[type=submit][value="{quoted}"]',
+            f'input[type=button][value="{quoted}"]',
+        ]
+    )
+    return clickable, "inferred:clickable_text"
 
 
 class ActionPlanner:

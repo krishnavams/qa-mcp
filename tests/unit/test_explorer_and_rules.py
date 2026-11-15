@@ -41,7 +41,9 @@ class TestExplorer:
         assert skipped["Delete account"].startswith("destructive")
         assert "form submission" in skipped["Sign in"]
         nxt = r1["action_requests"][0]
-        assert nxt["arguments"]["steps"][0] == {"action": "click", "selector": 'text="Forgot password"'}
+        click = nxt["arguments"]["steps"][0]
+        assert click["action"] == "click" and click["selector"].startswith('button:has-text("Forgot password")')
+        assert "text=" not in click["selector"]  # never a bare text match (it can hit headings)
 
         r2 = services.explorer.record_screen_observation(
             app, forgot_observation(), start["run_id"], nxt["report_hint"]["pending_id"]
