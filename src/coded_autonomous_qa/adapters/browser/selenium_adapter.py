@@ -109,6 +109,7 @@ class SeleniumAdapter(BrowserAdapter):
         self.remote_url = remote_url
         self.viewport = viewport
         self.driver: Any = None
+        self._main: Any = None
 
     @property
     def diagnostics_supported(self) -> bool:
@@ -151,6 +152,12 @@ class SeleniumAdapter(BrowserAdapter):
         self.reset()
 
     def reset(self) -> None:
+        handles = self.driver.window_handles
+        self._main = handles[0]
+        for h in handles[1:]:
+            self.driver.switch_to.window(h)
+            self.driver.close()
+        self.driver.switch_to.window(self._main)
         self.driver.get("about:blank")
         self.driver.delete_all_cookies()
         self._collect_diagnostics()
@@ -191,6 +198,39 @@ class SeleniumAdapter(BrowserAdapter):
             self.driver.get(url)
         except Exception as exc:
             raise AdapterError(f"Could not open {url}: {str(exc).splitlines()[0]}") from exc
+
+    def _other_pages(self) -> list[tuple[Any, str]]:
+        """WebDriver cannot intercept a new window's request, so each one is inspected as soon as it appears
+        (and closed by the base class if its URL is not allowed)."""
+        if self.driver is None:
+            return []
+        out = []
+        try:
+            for h in self.driver.window_handles:
+                if h == self._main:
+                    continue
+                try:
+                    self.driver.switch_to.window(h)
+                    deadline = time.monotonic() + 3
+                    url = self.driver.current_url
+                    while url in ("", "about:blank") and time.monotonic() < deadline:
+                        time.sleep(0.1)
+                        url = self.driver.current_url
+                except Exception:
+                    url = ""
+                out.append((h, url))
+        finally:
+            self.driver.switch_to.window(self._main)
+        return out
+
+    def _close_page(self, handle: Any) -> None:
+        try:
+            self.driver.switch_to.window(handle)
+            self.driver.close()
+        except Exception:
+            pass
+        finally:
+            self.driver.switch_to.window(self._main)
 
     def _recover(self) -> None:
         try:
@@ -233,7 +273,11 @@ class SeleniumAdapter(BrowserAdapter):
             return 0
 
     def _click(self, el: Any) -> None:
+        before = len(self.driver.window_handles)
         el.click()
+        deadline = time.monotonic() + 0.5  # give a tab opened by this click time to appear
+        while time.monotonic() < deadline and len(self.driver.window_handles) == before:
+            time.sleep(0.05)
 
     def _fill(self, el: Any, value: str) -> None:
         el.clear()

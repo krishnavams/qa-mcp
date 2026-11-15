@@ -9,7 +9,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 from coded_autonomous_qa.config import TEST_ENVIRONMENTS, PermissionMode, Settings
 
@@ -47,6 +47,7 @@ def _host_allowed(host: str, allowed: list[str]) -> bool:
 
 
 _FORBIDDEN_URL_CHARS = re.compile(r"[\x00-\x20\x7f\\]")  # whitespace, control chars, backslash
+_BRACKETED_AUTHORITY = re.compile(r"\[([0-9A-Fa-f:.]+)\](?::\d{1,5})?")
 _HOST_CHARS = re.compile(r"^[a-z0-9.\-]+$|^\[[0-9a-f:.]+\]$")
 
 
@@ -62,7 +63,7 @@ def validate_app_url(url: str, settings: Settings) -> str:
         raise SafetyError("URL is empty or too long.", code="invalid_url")
     if _FORBIDDEN_URL_CHARS.search(url):
         raise SafetyError("URL contains whitespace, control characters or backslashes.", code="invalid_url")
-    parts = urlsplit(url)
+    parts = _split(url)
     scheme = parts.scheme.lower()
     if scheme not in {"http", "https"}:
         raise SafetyError(
@@ -70,9 +71,20 @@ def validate_app_url(url: str, settings: Settings) -> str:
         )
     if "@" in parts.netloc or parts.username or parts.password:
         raise SafetyError("URLs must not embed credentials; use ${secret:NAME} references.", code="invalid_url")
-    raw_host = parts.hostname or ""
+    # Validate a bracketed (IPv6) authority ourselves: older Python patch releases' urlsplit accepts text after
+    # the closing bracket (e.g. "[::1]x"), so the stdlib cannot be relied on here.
+    if "[" in parts.netloc or "]" in parts.netloc:
+        m = _BRACKETED_AUTHORITY.fullmatch(parts.netloc)
+        if not m or ":" not in m.group(1) or not _is_ip(m.group(1)):
+            raise SafetyError("URL host is not a valid bracketed IPv6 address.", code="invalid_url")
+    try:
+        raw_host = parts.hostname or ""
+    except ValueError as exc:  # hostname parsing can fail on odd bracket syntax
+        raise SafetyError(f"URL host is malformed: {exc}", code="invalid_url") from exc
     if not raw_host:
         raise SafetyError("URL has no host.", code="invalid_url")
+    if ("[" in parts.netloc or "]" in parts.netloc) and not _is_ip(raw_host):
+        raise SafetyError("URL host is a bracketed literal that is not a valid IPv6 address.", code="invalid_url")
     try:
         port = parts.port
     except ValueError as exc:
@@ -99,8 +111,17 @@ def validate_app_url(url: str, settings: Settings) -> str:
             f"Host {host!r} is not in CODED_QA_ALLOWED_HOSTS ({', '.join(settings.allowed_hosts)}).",
             code="host_not_allowed",
         )
-    netloc = host if port is None else f"{host}:{port}"
+    shown = f"[{host}]" if ":" in host else host  # IPv6 literals keep their brackets
+    netloc = shown if port is None else f"{shown}:{port}"
     return urlunsplit((scheme, netloc, parts.path or "/", parts.query, parts.fragment))
+
+
+def _split(url: str) -> SplitResult:
+    """``urlsplit`` with parse errors (e.g. invalid IPv6 brackets) turned into a structured refusal."""
+    try:
+        return urlsplit(url)
+    except ValueError as exc:
+        raise SafetyError(f"URL is malformed: {exc}", code="invalid_url") from exc
 
 
 def _is_ip(host: str) -> bool:
@@ -126,8 +147,13 @@ def resolve_navigation_url(target: str | None, base_url: str, settings: Settings
             "Navigation target contains whitespace, control characters or backslashes.", code="invalid_url"
         )
     if t.startswith(("/", "./", "../", "?", "#")):
-        return validate_app_url(urljoin(validate_app_url(base_url, settings), t), settings)
-    scheme = urlsplit(t).scheme.lower()
+        base = validate_app_url(base_url, settings)
+        try:
+            joined = urljoin(base, t)
+        except ValueError as exc:  # e.g. "//[::1/x" -> Invalid IPv6 URL
+            raise SafetyError(f"Navigation target is malformed: {exc}", code="invalid_url") from exc
+        return validate_app_url(joined, settings)
+    scheme = _split(t).scheme.lower()
     if scheme in {"http", "https"}:
         return validate_app_url(t, settings)
     if scheme:
